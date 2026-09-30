@@ -17,6 +17,16 @@
   --vjs-transition-slow: visibility 1s, opacity 1s;
 }
 
+.video-js,
+.video-js:focus,
+.video-js:focus-visible,
+.video-js:focus-within,
+video.vjs-tech,
+video.vjs-tech:focus,
+video.vjs-tech:focus-visible {
+  outline: none;
+}
+
 /* --- SVG Icon Base --- */
 .vjs-svg-icon {
   display: inline-block;
@@ -616,7 +626,6 @@ body.vjs-full-window {
   display: none;
 }
 
-/* 隱藏 SVG 圓點指示器 */
 .vjs-play-progress .vjs-svg-icon {
   display: none;
 }
@@ -1298,7 +1307,6 @@ video::-webkit-media-text-track-display {
   transition: opacity 0.3s ease;
   opacity: 0;
   display: none;
-  /* default (info) appearance */
   background-color: rgba(0, 0, 0, 0.6);
   color: #fff;
   border: none;
@@ -1324,8 +1332,7 @@ video::-webkit-media-text-track-display {
   margin-bottom: 4px;
 }
 
-/* 白色模式：播放器獨立淺色配色
-   排除 .theme-dark 及其後代（暗黑模式保持原樣） */
+/* 白色模式：播放器獨立淺色配色 */
 :root .video-js:not(.theme-dark):not(.theme-dark *) {
     --vjs-bg: rgba(0, 0, 0, 0.74);
     --vjs-text: #ffffff;
@@ -1353,3 +1360,291 @@ video::-webkit-media-text-track-display {
     --warning: var(--vjs-warning);
     --error: var(--vjs-error);
 }
+
+/* ============================================
+   Playlist Panel
+   桌面：左側視頻，右側播放列表（水平排列）
+   手機：上面視頻，下面播放列表（垂直排列）
+   ============================================ */
+
+.vjs-player-wrapper {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: row;
+  overflow: hidden;
+}
+
+.vjs-player-wrapper > [data-vjs-player] {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 手機竪屏：改為垂直排列 */
+.vjs-player-wrapper.is-mobile-portrait {
+  flex-direction: column;
+}
+
+/* ---------- 播放列表面板 ---------- */
+.vjs-playlist {
+  font-family: var(--vjs-font-family, sans-serif);
+  color: var(--text, #fff);
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  flex: 0 0 auto;
+  background: rgba(0, 0, 0, 0.603);
+  backdrop-filter: blur(2px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transition: width 0.25s cubic-bezier(0.25, 0.1, 0.25, 1),
+              height 0.25s cubic-bezier(0.25, 0.1, 0.25, 1),
+              opacity 0.2s ease;
+  opacity: 0;
+  pointer-events: none;
+  width: 0;
+  height: 100%;
+  border-left: 1px solid var(--grid-contrast);
+  z-index: 100;
+}
+
+.vjs-playlist.is-open {
+  width: 250px;
+  max-width: 25%;
+  opacity: 1; 
+  pointer-events: auto;
+}
+
+/* 手機竪屏：面板改為底部 */
+.vjs-player-wrapper.is-mobile-portrait .vjs-playlist {
+  width: 100%;
+  height: 0;
+  border-left: none;
+  border-top: 1px solid var(--grid-contrast);
+}
+
+.vjs-player-wrapper.is-mobile-portrait .vjs-playlist.is-open {
+  width: 100%;
+  max-width: none;
+  height: 40vh;
+  max-height: 50vh;
+}
+
+/* 標題列 */
+.vjs-playlist-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--ghost-contrast, rgba(255, 255, 255, 0.08));
+  flex: 0 0 auto;
+  font-size: 1em;
+  line-height: 1.6;
+  background: var(--bg);
+}
+
+.vjs-playlist-title {
+  flex: 1 1 auto;
+  font-size: 1.1em;
+  font-weight: 500;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vjs-playlist-count {
+  flex: 0 0 auto;
+  font-size: 0.85em;
+  opacity: 0.6;
+  color: var(--text);
+}
+
+.vjs-playlist-btn {
+  flex: 0 0 auto;
+  background: none;
+  border: none;
+  color: var(--text);
+  opacity: 0.6;
+  cursor: pointer;
+  font-size: 0.9em;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 3px;
+  transition: background 0.15s, opacity 0.15s;
+}
+
+.vjs-playlist-btn:hover {
+  background: var(--ghost-contrast);
+  color: var(--text);
+  opacity: 1;
+}
+
+/* 列表 */
+.vjs-playlist-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 4px 0;
+  scrollbar-width: thin;
+  scrollbar-color: var(--faint-contrast, rgba(255, 255, 255, 0.2)) transparent;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+  background: var(--bg);
+  /* 禁用平滑滚动，避免恢复滚动位置时出现动画 */
+  scroll-behavior: auto !important;
+}
+
+.vjs-playlist-list::-webkit-scrollbar {
+  width: 6px;
+}
+
+.vjs-playlist-list::-webkit-scrollbar-thumb {
+  background: var(--faint-contrast, rgba(255, 255, 255, 0.2));
+  border-radius: 3px;
+}
+
+/* 列表項 */
+.vjs-playlist-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text);
+  opacity: 0.5;
+  transition: background 0.12s, opacity 0.12s;
+  border-left: 2px solid transparent;
+}
+
+.vjs-playlist-item:hover {
+  opacity: 0.7;
+}
+
+.vjs-playlist-item.is-current {
+  background: var(--ghost-contrast);
+  opacity: 1;
+  border-left-color: var(--good-contrast);
+  font-weight: 500;
+}
+
+.vjs-playlist-item-icon {
+  flex: 0 0 auto;
+  font-size: 0.8em;
+  opacity: 0.2;
+  width: 1em;
+  text-align: center;
+}
+
+.vjs-playlist-item.is-current .vjs-playlist-item-icon {
+  opacity: 1;
+  color: var(--good-contrast);
+}
+
+.vjs-playlist-item-name {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  overflow: hidden;
+  min-width: 0;
+  justify-content: space-between;
+}
+
+.vjs-playlist-item-name-text {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.vjs-playlist-item-meta {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: baseline;
+  font-size: 0.8em;
+  opacity: 0.75;
+  white-space: nowrap;
+  margin-left: auto;
+}
+
+.vjs-playlist-item-episode {
+  color: var(--comment-contrast);
+  font-weight: 600;
+}
+
+.vjs-playlist-item-meta-space {
+  display: inline-block;
+  width: 0.5em;
+}
+
+.vjs-playlist-item-comment {
+  color: var(--comment-contrast);
+  font-weight: 600;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--ghost-contrast);
+}
+
+/* 手機列表項加大 padding */
+.vjs-player-wrapper.is-mobile-portrait .vjs-playlist-item {
+  padding: 5px 16px;
+}
+
+/* ============================================
+   播放列表切換按鈕（控制欄內，remainingTimeDisplay 之後）
+   ============================================ */
+.vjs-playlist-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 3em;
+  height: 100%;
+  background: none;
+  border: none;
+  color: var(--text, #fff);
+  cursor: pointer;
+  font-size: 1em;
+  padding: 0;
+  opacity: 0.85;
+  transition: opacity 0.15s, background 0.15s, color 0.15s;
+  -webkit-tap-highlight-color: transparent;
+  flex: none;
+  z-index: 101;
+}
+
+.vjs-playlist-toggle:hover,
+.vjs-playlist-toggle:active {
+  opacity: 1;
+  background: var(--ghost-contrast, rgba(255, 255, 255, 0.1));
+}
+
+.vjs-playlist-toggle.is-open {
+  color: var(--good-contrast, #4a9eff);
+  opacity: 1;
+}
+
+.vjs-playlist-toggle-icon {
+  font-size: 1.1em;
+  line-height: 1;
+}
+
+/* ============================================
+   fileShow 弹层的平滑关闭（切源过渡遮罩）
+   - 由 player.js 的 closeWithFade() 添加 .vjs-closing
+   - 延迟后加 class → CSS opacity 过渡 → 过渡结束后才真正关闭
+   ============================================ */
+.dialog-backdrop.file-show.vjs-closing {
+  transition: opacity 200ms ease !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+

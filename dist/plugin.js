@@ -1,5 +1,5 @@
 exports.description = "A simplified & lightweight Video.js player plugin, modified from VenB304/videojs-player.";
-exports.version = 1.2;
+exports.version = 1.4;
 exports.apiRequired = 10.0;
 exports.repo = "Hug3O/Videos-player+";
 exports.frontend_css = [
@@ -59,6 +59,13 @@ exports.config = {
         helperText: "'Overlay' covers the player. 'Toast' shows a popup message.",
         frontend: true
     },
+    playlistPanel: {
+        showIf: x => x.config_tab === 'general',
+        type: 'boolean', defaultValue: true,
+        label: "Show Playlist Panel",
+        helperText: "Show a PotPlayer-style playlist on the right (desktop) or bottom (mobile portrait).",
+        frontend: true
+    },
 
     // ============================================
     // === 2. Interaction ===
@@ -87,14 +94,14 @@ exports.config = {
     },
     scrollSeekStep: {
         showIf: x => x.config_tab === 'interaction',
-        type: 'number', defaultValue: 0.8, min: 0.1, step: 0.1,
+        type: 'number', defaultValue: 1, min: 0.1, step: 0.1,
         label: "Scroll Seek Step (Seconds)",
         helperText: "How many seconds to jump per wheel notch. Supports decimals, e.g. 0.2 or 0.5.",
         frontend: true
     },
     doubleTapSeekSeconds: {
         showIf: x => x.config_tab === 'interaction',
-        type: 'number', defaultValue: 2, min: 1,
+        type: 'number', defaultValue: 5, min: 1,
         label: "Double Tap Seconds",
         helperText: "Time skipped per double-tap.",
         frontend: true
