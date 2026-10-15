@@ -51,7 +51,202 @@
         const folderCache = new Map();
         const listScrollCache = new Map();
 
-        // --- Helper: 中文数字解析 ---
+        // ============================================================
+        // === 内置 HFS File-Show 菜单操作（不依赖任何外部插件） ===
+        // ============================================================
+        const MENU_BUTTON_SELECTOR = [
+            '.dialog-backdrop.file-show button[title="Menu"]',
+            '.dialog-backdrop.file-show button[aria-label="Menu"]',
+            '.dialog-backdrop.file-show button:has(.fa-menu)',
+            '.dialog-backdrop.file-dialog button[title="Menu"]',
+            '.dialog-backdrop.file-dialog button[aria-label="Menu"]',
+            '.dialog-backdrop.file-dialog button:has(.fa-menu)',
+        ].join(', ');
+
+        const ITEM_SELECTOR_PREFIX = '#menu-entry-';
+        const MENU_CONTAINER_SELECTOR = '.file-menu';
+        const FILE_DIALOG_SELECTOR = '.dialog-backdrop.file-dialog';
+
+        let hiddenFileDialog = null;
+        let subDialogObserver = null;
+
+        function getMenuItem(action) {
+            return document.querySelector(`${ITEM_SELECTOR_PREFIX}${action}`);
+        }
+
+        function getMenuButton() {
+            // 优先用 CSS 选择器
+            const direct = document.querySelector(MENU_BUTTON_SELECTOR);
+            if (direct) return direct;
+
+            // 回退：遍历按钮找 title/aria-label 含 "menu" 或含 .fa-menu 图标
+            const candidates = document.querySelectorAll(
+                '.dialog-backdrop.file-show button, .dialog-backdrop.file-dialog button'
+            );
+            for (const btn of candidates) {
+                const label = (
+                    btn.getAttribute('title') ||
+                    btn.getAttribute('aria-label') ||
+                    ''
+                );
+                if (/menu/i.test(label)) return btn;
+                if (btn.querySelector('.fa-menu')) return btn;
+            }
+            return null;
+        }
+
+        function isMenuOpen() {
+            return !!document.querySelector(MENU_CONTAINER_SELECTOR);
+        }
+
+        function getAllMenuContainers() {
+            return Array.from(document.querySelectorAll(MENU_CONTAINER_SELECTOR));
+        }
+
+        function getFileDialog() {
+            return document.querySelector(FILE_DIALOG_SELECTOR);
+        }
+
+        function hasSubDialog() {
+            return !!document.querySelector(
+                '.dialog-backdrop.dialog-prompt:not([style*="display: none"]), ' +
+                '.dialog-backdrop.dialog-alert:not([style*="display: none"]), ' +
+                '.dialog-backdrop.dialog-confirm:not([style*="display: none"])'
+            );
+        }
+
+        function hideFileDialog() {
+            const dialog = getFileDialog();
+            if (!dialog) return;
+            if (hiddenFileDialog && hiddenFileDialog !== dialog) {
+                hiddenFileDialog.style.display = '';
+            }
+            hiddenFileDialog = dialog;
+            dialog.style.display = 'none';
+        }
+
+        function restoreFileDialog() {
+            if (!hiddenFileDialog) return;
+            hiddenFileDialog.style.display = '';
+            hiddenFileDialog = null;
+        }
+
+        function ensureSubDialogObserver() {
+            if (subDialogObserver) return;
+            subDialogObserver = new MutationObserver(() => {
+                if (hiddenFileDialog && !hasSubDialog()) {
+                    restoreFileDialog();
+                }
+            });
+            subDialogObserver.observe(document.body, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['style', 'hidden', 'class'],
+            });
+        }
+
+        function closeAllMenus() {
+            const menus = getAllMenuContainers();
+            if (menus.length === 0) return false;
+
+            const closer = document.querySelector(
+                '.dialog-backdrop.file-show .dialog-closer, ' +
+                '.dialog-backdrop.file-dialog .dialog-closer'
+            );
+            if (closer) closer.click();
+
+            const remaining = getAllMenuContainers();
+            if (remaining.length > 1) {
+                remaining.slice(1).forEach((menu) => menu.remove());
+            }
+            return true;
+        }
+
+        function clickMenuButton(options = {}) {
+            const { toggle = true } = options;
+
+            if (isMenuOpen()) {
+                if (toggle) {
+                    closeAllMenus();
+                    return true;
+                }
+                closeAllMenus();
+            }
+
+            const button = getMenuButton();
+            if (!button) return false;
+
+            button.click();
+            return true;
+        }
+
+        function waitForMenuItem(action, timeoutMs = 1500, intervalMs = 50) {
+            return new Promise((resolve) => {
+                const startedAt = Date.now();
+                function check() {
+                    const item = getMenuItem(action);
+                    if (item) return resolve(item);
+                    if (Date.now() - startedAt >= timeoutMs) return resolve(null);
+                    setTimeout(check, intervalMs);
+                }
+                check();
+            });
+        }
+
+        /**
+         * 内置菜单点击：打开菜单 → 等待目标项 → 点击。
+         * 对 comment 会隐藏 file-dialog，避免与 comment 子对话框叠加。
+         */
+        async function clickFileMenuItem(action, options = {}) {
+            const {
+                openMenuIfNeeded = true,
+                timeoutMs = 1500,
+                intervalMs = 50,
+            } = options;
+
+            let item = getMenuItem(action);
+
+            if (item) {
+                item.click();
+                if (action === 'comment') {
+                    requestAnimationFrame(() => {
+                        if (hasSubDialog()) hideFileDialog();
+                        else requestAnimationFrame(() => {
+                            if (hasSubDialog()) hideFileDialog();
+                        });
+                    });
+                }
+                return true;
+            }
+
+            if (!openMenuIfNeeded) return false;
+
+            closeAllMenus();
+
+            if (!clickMenuButton({ toggle: false })) return false;
+
+            item = await waitForMenuItem(action, timeoutMs, intervalMs);
+            if (!item) return false;
+
+            item.click();
+
+            if (action === 'comment') {
+                requestAnimationFrame(() => {
+                    if (hasSubDialog()) hideFileDialog();
+                    else requestAnimationFrame(() => {
+                        if (hasSubDialog()) hideFileDialog();
+                    });
+                });
+            }
+            return true;
+        }
+
+        ensureSubDialogObserver();
+
+        // ============================================================
+        // === Helper: 中文数字解析 ===
+        // ============================================================
         const parseChineseNum = (str) => {
             if (/^\d+$/.test(str)) return parseInt(str);
             const map = { '零':0,'一':1,'二':2,'三':3,'四':4,'五':5,'六':6,'七':7,'八':8,'九':9,'十':10 };
@@ -133,9 +328,6 @@
         };
 
         // --- 統一的釋放函數：停止舊請求 + 清理 player 狀態 ---
-        // 用於手動切源、刪除當前播放文件、src 變更等所有場景。
-        // 只清 tech 與 src，不動 wrapper / PlaylistPanel 的 DOM，
-        // 保持界面殘留銜接，視覺上與手動切換一致。
         const releasePlayer = (player, videoEl) => {
             if (!player || player.isDisposed()) return;
             try {
@@ -288,7 +480,6 @@
             const folderUri = lastSlash >= 0 ? clean.substring(0, lastSlash + 1) : '';
             if (!folderUri) return [];
 
-            // 强制刷新时，先删除缓存，确保拿到最新的 comment / episode 等数据
             if (forceRefresh) {
                 folderCache.delete(folderUri);
             }
@@ -298,7 +489,6 @@
             }
 
             try {
-                // 加上时间戳，绕过浏览器缓存，确保 comment 是最新的
                 const apiUrl = `/~/api/get_file_list?uri=${encodeURIComponent(folderUri)}&_t=${Date.now()}`;
                 const res = await fetch(apiUrl, {
                     credentials: 'same-origin',
@@ -386,6 +576,45 @@
             try { localStorage.setItem('vjs-playlist-open', open ? '1' : '0'); } catch {}
         };
 
+        // --- 長按 / 雙擊當前播放檔案 → 呼出 comment（與播放切換完全獨立） ---
+        const getCurrentFileShowName = () => {
+            const bar = document.querySelector(
+                '.dialog-backdrop.file-show .bar .filename, ' +
+                '.dialog-backdrop.file-dialog .filename'
+            );
+            if (!bar) return '';
+
+            const folder = bar.querySelector('.folder');
+            let text = '';
+            bar.childNodes.forEach((n) => {
+                if (n !== folder && n.nodeType === 3) {
+                    text += n.textContent;
+                }
+            });
+            return text.trim();
+        };
+
+        const isCurrentFileShow = (item) => {
+            if (!item || !item.name) return false;
+            return getCurrentFileShowName() === item.name;
+        };
+
+        /**
+         * 触发 comment：直接走内置 clickFileMenuItem。
+         * 不再依赖任何外部插件提供的 window.hfsMenuClick。
+         */
+        const triggerCommentForItem = async (item) => {
+            if (!isCurrentFileShow(item)) return false;
+            try {
+                const ok = await clickFileMenuItem('comment');
+                if (!ok) console.warn('[VideoJS] Built-in comment trigger failed.');
+                return ok;
+            } catch (e) {
+                console.warn('[VideoJS] Built-in comment trigger error:', e);
+                return false;
+            }
+        };
+
         const PlaylistPanel = ({ src, playerRef, open, onClose }) => {
             const [items, setItems] = React.useState(() => {
                 const fu = getFolderUri(src);
@@ -397,20 +626,23 @@
             const panelRef = React.useRef(null);
             const listRef = React.useRef(null);
             const currentItemRef = React.useRef(null);
-            // 標記：此面板實例是否已執行過「首次自動滾動定位」
             const hasAutoScrolledRef = React.useRef(false);
-            // 追蹤上一版列表，用於偵測「當前播放文件被刪除」
             const prevItemsRef = React.useRef([]);
-            // 避免自動切換過程中重複觸發
             const autoAdvancingRef = React.useRef(false);
+
+            // 長按手勢狀態
+            const gestureRef = React.useRef({
+                timer: null,
+                longPressed: false,
+                startX: 0,
+                startY: 0,
+            });
+            const LONG_PRESS_MS = 500;
+            const MOVE_THRESHOLD = 10;
 
             const folderUri = getFolderUri(src);
 
-            // 列表拉取：
-            // - 先立即用缓存数据渲染，避免闪空；
-            // - 每次 src 变化（切视频）都强制重拉一次，拿到最新的 comment / episode 等；
-            // - 重拉不显示 loading（已有数据时原地替换），避免闪烁；
-            // - 150ms 防抖，避免快速连切时打爆请求。
+            // 列表拉取
             React.useEffect(() => {
                 let cancelled = false;
                 if (!folderUri) return;
@@ -465,6 +697,44 @@
                 };
             }, [src]);
 
+            // --- 播放结束自动连播下一个（完整列表循环） ---
+            React.useEffect(() => {
+                const player = playerRef && playerRef.current;
+                if (!player || player.isDisposed()) return;
+
+                const handleEnded = () => {
+                    if (autoAdvancingRef.current) return;
+                    if (!items.length) return;
+
+                    const currentFilename = getCurrentFilename(player, src);
+                    if (!currentFilename) return;
+
+                    const idx = items.findIndex(it => it.name === currentFilename);
+                    if (idx < 0) return;
+
+                    const nextItem = items[(idx + 1) % items.length];
+                    if (!nextItem) return;
+
+                    autoAdvancingRef.current = true;
+                    requestAnimationFrame(() => {
+                        requestAnimationFrame(() => {
+                            try {
+                                handleSelectRef.current && handleSelectRef.current(nextItem, true);
+                            } finally {
+                                autoAdvancingRef.current = false;
+                            }
+                        });
+                    });
+                };
+
+                player.on('ended', handleEnded);
+
+                return () => {
+                    if (!player || player.isDisposed()) return;
+                    player.off('ended', handleEnded);
+                };
+            }, [items, src]);
+
             // 僅在「首次進入 fileShow」時自動滾動定位到當前播放項。
             React.useLayoutEffect(() => {
                 if (!open || !folderUri) return;
@@ -484,14 +754,14 @@
                 if (target && target.scrollIntoView) {
                     const prevBehavior = el.style.scrollBehavior;
                     el.style.scrollBehavior = 'auto';
-                    target.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });
+                    target.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'auto' });
                     el.style.scrollBehavior = prevBehavior;
                 }
 
                 hasAutoScrolledRef.current = true;
             }, [open, folderUri, items, src]);
 
-            // 面板關閉時重置「首次滾動」標記，讓下次開啟 fileShow 能重新定位
+            // 面板關閉時重置「首次滾動」標記
             React.useEffect(() => {
                 if (!open) {
                     hasAutoScrolledRef.current = false;
@@ -514,8 +784,6 @@
             }, [open, folderUri]);
 
             // --- 刪除當前播放文件後的自動銜接 ---
-            // 機制：把「刪除」視為一次 src 切換。先釋放舊 player 狀態（停止對已刪
-            // 除文件的請求），再復用 handleSelect 播放下一個，界面保持殘留銜接。
             React.useEffect(() => {
                 const prev = prevItemsRef.current;
                 const curr = items;
@@ -540,14 +808,11 @@
                         return;
                     }
 
-                    // 1) 立即釋放舊視頻，停止對已刪除文件的請求（避免 404 重試卡頓）
                     releasePlayer(player);
 
-                    // 2) 決定下一個可播項：原位置優先，否則最後一個
                     const oldIdx = prev.findIndex(it => it.name === currentFilename);
                     const nextItem = curr[oldIdx] || curr[curr.length - 1] || null;
 
-                    // 3) 延遲兩幀再切，等列表 DOM 更新完，避免焦點/動畫衝突
                     if (nextItem) {
                         autoAdvancingRef.current = true;
                         requestAnimationFrame(() => {
@@ -560,7 +825,6 @@
                             });
                         });
                     } else {
-                        // 列表已空 → 保持釋放後的靜止狀態即可
                         setCurrentName('');
                     }
                 }
@@ -568,10 +832,9 @@
                 prevItemsRef.current = curr;
             }, [items, src]);
 
-            // handleSelect 的 ref（避免閉包捕獲舊 playerRef/src）
             const handleSelectRef = React.useRef(null);
 
-            const handleSelect = (item) => {
+            const handleSelect = (item, forcePlay = false) => {
                 const player = playerRef && playerRef.current;
                 if (!player || player.isDisposed()) return;
 
@@ -580,15 +843,10 @@
                 })();
                 if (decodeURI(item.url) === playerSrc) return;
 
-                // 记录切换前是否正在播放，用于决定切换后是否继续播放
-                const wasPlaying = !player.paused();
+                const wasPlaying = forcePlay || !player.paused();
 
-                // 無論走哪個分支，切源前先徹底釋放舊狀態。
-                // 這樣舊 <video> 已 load() 空白 src，不會再對舊文件（可能已被刪除）
-                // 發請求；界面 wrapper / PlaylistPanel DOM 保留，視覺上是殘留銜接。
                 releasePlayer(player);
 
-                // 全屏时直接切源，不经过 HFS.fileShow，避免触发 Auto-play 按钮
                 if (isWrapperFullscreen()) {
                     player.src({ src: item.url, type: determineMimeType(item.url) });
                     if (wasPlaying) {
@@ -616,8 +874,6 @@
                 oldDialogs.forEach(stopVideosIn);
 
                 try {
-                    // 關鍵：不傳 startPlaying: true，避免 HFS 強制把 Auto-play 按鈕切成 true。
-                    // 是否播放由我們自己根據 wasPlaying 決定。
                     HFS.fileShow(entry, { startPlaying: false });
                 } catch (e) {
                     console.warn('[VideoJS] HFS.fileShow threw:', e);
@@ -639,7 +895,6 @@
                             if (d !== newest && d.parentNode) closeWithFade(d, 180, 220);
                         });
 
-                        // 如果切換前正在播放，則讓新播放器繼續播放
                         if (wasPlaying && newest) {
                             const newVideoEl = newest.querySelector('video.video-js, video.vjs-tech, .video-js video');
                             if (newVideoEl) {
@@ -654,8 +909,61 @@
                 });
             };
 
-            // 更新 ref，讓自動銜接的 effect 能呼叫最新的 handleSelect
             handleSelectRef.current = handleSelect;
+
+            // === 長按 / 雙擊手勢：只對當前播放中的檔案觸發 comment ===
+            const clearGestureTimer = () => {
+                if (gestureRef.current.timer) {
+                    clearTimeout(gestureRef.current.timer);
+                    gestureRef.current.timer = null;
+                }
+            };
+
+            const startLongPressTimer = (item) => {
+                clearGestureTimer();
+                gestureRef.current.longPressed = false;
+                gestureRef.current.timer = setTimeout(() => {
+                    gestureRef.current.timer = null;
+                    gestureRef.current.longPressed = true;
+
+                    // 只有當前播放中的檔案才觸發 comment，其他檔案不動作
+                    if (isCurrentFileShow(item)) {
+                        triggerCommentForItem(item);
+                    }
+                }, LONG_PRESS_MS);
+            };
+
+            const onItemPointerDown = (item, e) => {
+                gestureRef.current.startX = e.clientX ?? e.touches?.[0]?.clientX ?? 0;
+                gestureRef.current.startY = e.clientY ?? e.touches?.[0]?.clientY ?? 0;
+                startLongPressTimer(item);
+            };
+
+            const onItemPointerMove = (e) => {
+                if (!gestureRef.current.timer) return;
+                const x = e.clientX ?? e.touches?.[0]?.clientX ?? 0;
+                const y = e.clientY ?? e.touches?.[0]?.clientY ?? 0;
+                const dx = Math.abs(x - gestureRef.current.startX);
+                const dy = Math.abs(y - gestureRef.current.startY);
+                if (dx > MOVE_THRESHOLD || dy > MOVE_THRESHOLD) {
+                    clearGestureTimer();
+                }
+            };
+
+            const onItemPointerUp = () => {
+                clearGestureTimer();
+                gestureRef.current.longPressed = false;
+            };
+
+            // 雙擊：只對當前播放中的檔案觸發 comment
+            const onItemDoubleClick = (item, e) => {
+                e.preventDefault();
+                e.stopPropagation();
+
+                if (isCurrentFileShow(item)) {
+                    triggerCommentForItem(item);
+                }
+            };
 
             return h('div', {
                 className: 'vjs-playlist' + (open ? ' is-open' : ''),
@@ -690,7 +998,18 @@
                         ref: isCurrent ? currentItemRef : null,
                         className: 'vjs-playlist-item' + (isCurrent ? ' is-current' : ''),
                         onClick: () => { handleSelect(item); },
+                        onDblClick: (e) => onItemDoubleClick(item, e),
                         title: item.name,
+
+                        onMouseDown: (e) => onItemPointerDown(item, e),
+                        onMouseMove: (e) => onItemPointerMove(e),
+                        onMouseUp: () => onItemPointerUp(),
+                        onMouseLeave: () => clearGestureTimer(),
+
+                        onTouchStart: (e) => onItemPointerDown(item, e),
+                        onTouchMove: (e) => onItemPointerMove(e),
+                        onTouchEnd: () => onItemPointerUp(),
+                        onTouchCancel: () => clearGestureTimer(),
                     }, [
                         h('span', { className: 'vjs-playlist-item-icon' }, '▶\uFE0E'),
                         h('span', { className: 'vjs-playlist-item-name' }, [
@@ -1280,7 +1599,6 @@
                 };
             }, []);
 
-            // --- src 變更時釋放舊狀態（使用統一的 releasePlayer） ---
             const prevSrcRef = React.useRef(props.src);
             React.useEffect(() => {
                 if (prevSrcRef.current && prevSrcRef.current !== props.src) {

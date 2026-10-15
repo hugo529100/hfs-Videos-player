@@ -1637,14 +1637,17 @@ video::-webkit-media-text-track-display {
   line-height: 1;
 }
 
-/* ============================================
-   fileShow 弹层的平滑关闭（切源过渡遮罩）
-   - 由 player.js 的 closeWithFade() 添加 .vjs-closing
-   - 延迟后加 class → CSS opacity 过渡 → 过渡结束后才真正关闭
-   ============================================ */
+/*fileShow 弹层的平滑关闭（切源过渡遮罩） */
+
 .dialog-backdrop.file-show.vjs-closing {
   transition: opacity 200ms ease !important;
   opacity: 0 !important;
   pointer-events: none !important;
 }
 
+/*讓手機長按不觸發原生選單*/
+.vjs-playlist-item {
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+}
