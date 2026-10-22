@@ -11,7 +11,6 @@
   --vjs-menu-hover-bg-transparent: var(--ghost-contrast, rgba(153, 153, 153, 0.5));
   --vjs-overlay-bg: var(--button-bg, rgba(0, 0, 0, 0.6));
   --vjs-error-overlay-bg: var(--deepprevew, rgba(0, 0, 0, 0.85));
-  --vjs-font-family: inherit;
   --vjs-transition-default: all 0.4s;
   --vjs-transition-fast: visibility 0.1s, opacity 0.1s;
   --vjs-transition-slow: visibility 1s, opacity 1s;
@@ -71,7 +70,6 @@ video.vjs-tech:focus-visible {
   line-height: 1;
   font-weight: normal;
   font-style: normal;
-  font-family: var(--vjs-font-family);
   word-break: initial;
 }
 
@@ -95,7 +93,6 @@ video.vjs-tech:focus-visible {
 }
 
 .video-js ul {
-  font-family: inherit;
   font-size: inherit;
   line-height: inherit;
   list-style-position: outside;
@@ -200,7 +197,6 @@ body.vjs-full-window {
   color: var(--button-text);
   background-color: var(--button-bg);
   font-size: 18px;
-  font-family: var(--vjs-font-family);
   text-align: center;
   width: 300px;
   height: 150px;
@@ -325,7 +321,6 @@ body.vjs-full-window {
   display: block;
   padding: 0;
   margin: 0;
-  font-family: var(--vjs-font-family);
   overflow: auto;
 }
 
@@ -663,7 +658,6 @@ body.vjs-full-window {
   border: 1px solid var(--text);
   color: var(--button-text) !important;
   float: right;
-  font-family: var(--vjs-font-family);
   font-size: 1em;
   padding: 3px;
   pointer-events: none;
@@ -811,6 +805,10 @@ body.vjs-full-window {
   width: auto;
   padding-left: 1em;
   padding-right: 1em;
+  border: 1px solid rgba(133, 133, 133, 0.171);
+border-bottom: none;
+border-top: none;
+border-right: none;
 }
 
 .vjs-live .vjs-time-control,
@@ -1250,7 +1248,6 @@ video::-webkit-media-text-track-display {
   color: var(--text);
   padding: 10px 20px;
   border-radius: 5px;
-  font-family: sans-serif;
   font-size: 14px;
   z-index: 99;
   pointer-events: none;
@@ -1303,7 +1300,6 @@ video::-webkit-media-text-track-display {
   text-align: center;
   padding: 12px 20px;
   border-radius: 8px;
-  font-family: sans-serif;
   transition: opacity 0.3s ease;
   opacity: 0;
   display: none;
@@ -1361,12 +1357,6 @@ video::-webkit-media-text-track-display {
     --error: var(--vjs-error);
 }
 
-/* ============================================
-   Playlist Panel
-   桌面：左側視頻，右側播放列表（水平排列）
-   手機：上面視頻，下面播放列表（垂直排列）
-   ============================================ */
-
 .vjs-player-wrapper {
   position: relative;
   width: 100%;
@@ -1392,7 +1382,6 @@ video::-webkit-media-text-track-display {
 
 /* ---------- 播放列表面板 ---------- */
 .vjs-playlist {
-  font-family: var(--vjs-font-family, sans-serif);
   color: var(--text, #fff);
   user-select: none;
   -webkit-tap-highlight-color: transparent;
@@ -1415,7 +1404,7 @@ video::-webkit-media-text-track-display {
 
 .vjs-playlist.is-open {
   width: 250px;
-  max-width: 25%;
+  max-width: 26%;
   opacity: 1; 
   pointer-events: auto;
 }
@@ -1448,8 +1437,25 @@ video::-webkit-media-text-track-display {
   background: var(--bg);
 }
 
-.vjs-playlist-title {
+/* 標題列左側：標題 + 文件數/當前排位 */
+.vjs-playlist-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* 標題列右側：碼率 + 按鈕 */
+.vjs-playlist-header-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.vjs-playlist-title {
+  flex: 0 1 auto;
   font-size: 1.1em;
   font-weight: 500;
   color: var(--text);
@@ -1463,6 +1469,19 @@ video::-webkit-media-text-track-display {
   font-size: 0.85em;
   opacity: 0.6;
   color: var(--text);
+  white-space: nowrap;
+}
+
+.vjs-playlist-bitrate {
+  flex: 0 0 auto;
+  font-size: 0.8em;
+  opacity: 0.75;
+  color: var(--text);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  min-width: 4.5em;
+  text-align: right;
+  letter-spacing: 0.02em;
 }
 
 .vjs-playlist-btn {
@@ -1519,7 +1538,7 @@ video::-webkit-media-text-track-display {
   font-size: 14px;
   line-height: 1.6;
   color: var(--text);
-  opacity: 0.5;
+  opacity: 0.6;
   transition: background 0.12s, opacity 0.12s;
   border-left: 2px solid transparent;
 }
@@ -1625,6 +1644,7 @@ video::-webkit-media-text-track-display {
 .vjs-playlist-toggle:active {
   opacity: 1;
   background: var(--ghost-contrast, rgba(255, 255, 255, 0.1));
+  color: var(--good-contrast, #4a9eff);
 }
 
 .vjs-playlist-toggle.is-open {
@@ -1650,4 +1670,21 @@ video::-webkit-media-text-track-display {
     -webkit-user-select: none;
     user-select: none;
     -webkit-touch-callout: none;
+}
+
+/* 锁定时控制栏常显 */
+.vjs-controls-locked .vjs-control-bar {
+  visibility: visible !important;
+  opacity: 1 !important;
+  pointer-events: auto !important;
+}
+
+/* 锁按钮样式 */
+.vjs-playlist-lock {
+  font-size: 1em;
+  opacity: 0.5;
+}
+.vjs-playlist-lock.is-locked {
+  opacity: 0.8;
+  color: var(--good-contrast, #4a9eff);
 }

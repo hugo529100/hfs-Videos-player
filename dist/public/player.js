@@ -358,6 +358,17 @@
             return (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + ' ' + units[i];
         };
 
+        // --- 碼率格式化：kbps / Mbps ---
+        const formatBitrate = (bitsPerSec) => {
+            if (!bitsPerSec || isNaN(bitsPerSec) || bitsPerSec <= 0) return '';
+            const kbps = bitsPerSec / 1000;
+            if (kbps >= 1000) {
+                const mbps = kbps / 1000;
+                return (mbps >= 10 ? mbps.toFixed(0) : mbps.toFixed(1)) + ' Mbps';
+            }
+            return Math.round(kbps) + ' kbps';
+        };
+
         const formatTs = (ts) => {
             if (ts == null || isNaN(ts)) return '';
             const d = new Date(ts);
@@ -615,13 +626,54 @@
             }
         };
 
-        const PlaylistPanel = ({ src, playerRef, open, onClose }) => {
+        // 取得「當前播放檔位的編碼碼率」（bps），與網速無關。
+        // 優先：VHS qualityLevels 當前選中檔位的 bitrate；
+        // 退回：fileSize / duration × 8（單檔 Progressive）。
+        // 轉碼流（?ffmpeg）碼率未知，回傳 0 表示不顯示。
+        const getCurrentBitrate = (player, items) => {
+            if (!player || player.isDisposed()) return 0;
+
+            // 1) 自適應流：當前選中檔位的標稱碼率
+            try {
+                const ql = player.qualityLevels && player.qualityLevels();
+                if (ql && ql.length) {
+                    const idx = ql.selectedIndex;
+                    const level = idx >= 0 ? ql[idx] : null;
+                    if (level && level.bitrate > 0) return level.bitrate;
+                }
+            } catch (e) {}
+
+            // 2) 單檔：fileSize / duration
+            try {
+                const curSrc = player.currentSrc() || '';
+                if (/[?&]ffmpeg\b/.test(curSrc)) return 0;
+                const dur = player.duration();
+                if (!dur || !isFinite(dur) || dur <= 1) return 0;
+                const name = getCurrentFilename(player);
+                if (!name) return 0;
+                let size = null;
+                const list = items || [];
+                const it = list.find(x => x.name === name);
+                if (it && it.size) size = it.size;
+                if (!size) {
+                    const entry = findHfsEntryByName(name);
+                    if (entry) size = entry.s != null ? entry.s : (entry.size != null ? entry.size : null);
+                }
+                if (!size) return 0;
+                return (size / dur) * 8;
+            } catch (e) {
+                return 0;
+            }
+        };
+
+        const PlaylistPanel = ({ src, playerRef, open, onClose, controlsLocked, onToggleControlsLocked, onRegisterNav }) => {
             const [items, setItems] = React.useState(() => {
                 const fu = getFolderUri(src);
                 return fu && folderCache.has(fu) ? folderCache.get(fu) : [];
             });
             const [currentName, setCurrentName] = React.useState('');
             const [loading, setLoading] = React.useState(false);
+            const [bitrate, setBitrate] = React.useState(0);
 
             const panelRef = React.useRef(null);
             const listRef = React.useRef(null);
@@ -629,6 +681,9 @@
             const hasAutoScrolledRef = React.useRef(false);
             const prevItemsRef = React.useRef([]);
             const autoAdvancingRef = React.useRef(false);
+
+            const itemsRef = React.useRef(items);
+            itemsRef.current = items;
 
             // 長按手勢狀態
             const gestureRef = React.useRef({
@@ -641,6 +696,51 @@
             const MOVE_THRESHOLD = 10;
 
             const folderUri = getFolderUri(src);
+
+            // --- 碼率：讀當前檔位編碼碼率；切檔 / 加檔 / 清單更新時即時刷新 ---
+            React.useEffect(() => {
+                if (!open) return;
+                const player = playerRef.current;
+                if (!player || player.isDisposed()) return;
+
+                const updateBitrate = () => {
+                    const b = getCurrentBitrate(player, itemsRef.current);
+                    setBitrate(b > 0 ? b : 0);
+                };
+
+                updateBitrate();
+
+                // 播放器事件
+                player.on('loadedmetadata', updateBitrate);
+                player.on('durationchange', updateBitrate);
+                player.on('sourceset', updateBitrate);
+                player.on('loadstart', updateBitrate);
+
+                // qualityLevels 事件（切檔即時更新）
+                let ql = null;
+                const onQlChange = () => updateBitrate();
+                try {
+                    ql = player.qualityLevels && player.qualityLevels();
+                } catch (e) {}
+                if (ql && ql.addEventListener) {
+                    ql.addEventListener('change', onQlChange);
+                    ql.addEventListener('addqualitylevel', onQlChange);
+                    ql.addEventListener('removequalitylevel', onQlChange);
+                }
+
+                return () => {
+                    if (!player || player.isDisposed()) return;
+                    player.off('loadedmetadata', updateBitrate);
+                    player.off('durationchange', updateBitrate);
+                    player.off('sourceset', updateBitrate);
+                    player.off('loadstart', updateBitrate);
+                    if (ql && ql.removeEventListener) {
+                        ql.removeEventListener('change', onQlChange);
+                        ql.removeEventListener('addqualitylevel', onQlChange);
+                        ql.removeEventListener('removequalitylevel', onQlChange);
+                    }
+                };
+            }, [open, src]);
 
             // 列表拉取
             React.useEffect(() => {
@@ -911,6 +1011,38 @@
 
             handleSelectRef.current = handleSelect;
 
+            // --- 向父组件注册 prev/next 导航能力（供键盘 ↑/↓ 使用） ---
+            React.useEffect(() => {
+                if (!onRegisterNav) return;
+                onRegisterNav({
+                    canNavigate: () => items.length > 0,
+                    goPrev: () => {
+                        const player = playerRef && playerRef.current;
+                        if (!player || player.isDisposed()) return false;
+                        if (!items.length) return false;
+                        const currentFilename = getCurrentFilename(player, src);
+                        const idx = items.findIndex(it => it.name === currentFilename);
+                        if (idx < 0) return false;
+                        const prevItem = items[(idx - 1 + items.length) % items.length];
+                        if (!prevItem) return false;
+                        handleSelect(prevItem, true);
+                        return true;
+                    },
+                    goNext: () => {
+                        const player = playerRef && playerRef.current;
+                        if (!player || player.isDisposed()) return false;
+                        if (!items.length) return false;
+                        const currentFilename = getCurrentFilename(player, src);
+                        const idx = items.findIndex(it => it.name === currentFilename);
+                        if (idx < 0) return false;
+                        const nextItem = items[(idx + 1) % items.length];
+                        if (!nextItem) return false;
+                        handleSelect(nextItem, true);
+                        return true;
+                    },
+                });
+            }, [items, src, onRegisterNav]);
+
             // === 長按 / 雙擊手勢：只對當前播放中的檔案觸發 comment ===
             const clearGestureTimer = () => {
                 if (gestureRef.current.timer) {
@@ -965,27 +1097,59 @@
                 }
             };
 
+            // 左側顯示：文件數/當前排位數
+            const currentIndex = (() => {
+                if (!items.length || !currentName) return 0;
+                const idx = items.findIndex(it => it.name === currentName);
+                return idx >= 0 ? idx + 1 : 0;
+            })();
+            const countLabel = currentIndex > 0
+                ? `${items.length}/${currentIndex}`
+                : `${items.length}`;
+
             return h('div', {
                 className: 'vjs-playlist' + (open ? ' is-open' : ''),
                 ref: panelRef,
             }, [
                 h('div', { className: 'vjs-playlist-header', key: 'header' }, [
-                    h('span', { className: 'vjs-playlist-title' }, loading ? '※\uFE0E Loading…' : '☰\uFE0E Playlist'),
-                    h('span', { className: 'vjs-playlist-count' }, `${items.length}`),
-                    h('button', {
-                        className: 'vjs-playlist-btn vjs-playlist-collapse',
-                        title: 'Hide',
-                        onMouseDown: (e) => {
-                            e.stopPropagation();
-                            e.preventDefault();
-                            onClose();
-                        },
-                        onTouchEnd: (e) => {
-                            e.stopPropagation();
-                            e.preventDefault();
-                            onClose();
-                        },
-                    }, '✖\uFE0E'),
+                    h('div', { className: 'vjs-playlist-header-left', key: 'left' }, [
+                        h('span', { className: 'vjs-playlist-title' }, loading ? '※\uFE0E Loading…' : '☰\uFE0E Playlist'),
+                        h('span', { className: 'vjs-playlist-count' }, countLabel),
+                    ]),
+                    h('div', { className: 'vjs-playlist-header-right', key: 'right' }, [
+                        bitrate > 0 && h('span', {
+                            className: 'vjs-playlist-bitrate',
+                            title: 'Bitrate',
+                        }, formatBitrate(bitrate)),
+                        h('button', {
+                            className: 'vjs-playlist-btn vjs-playlist-lock' + (controlsLocked ? ' is-locked' : ''),
+                            title: controlsLocked ? 'Unlock Controls' : 'Lock Controls',
+                            onMouseDown: (e) => {
+                                e.stopPropagation();
+                                e.preventDefault();
+                                onToggleControlsLocked();
+                            },
+                            onTouchEnd: (e) => {
+                                e.stopPropagation();
+                                e.preventDefault();
+                                onToggleControlsLocked();
+                            },
+                        }, controlsLocked ? '▲\uFE0E' : '△\uFE0E'),
+                        h('button', {
+                            className: 'vjs-playlist-btn vjs-playlist-collapse',
+                            title: 'Hide',
+                            onMouseDown: (e) => {
+                                e.stopPropagation();
+                                e.preventDefault();
+                                onClose();
+                            },
+                            onTouchEnd: (e) => {
+                                e.stopPropagation();
+                                e.preventDefault();
+                                onClose();
+                            },
+                        }, '◢\uFE0E'),
+                    ]),
                 ]),
                 h('div', {
                     className: 'vjs-playlist-list',
@@ -1150,7 +1314,7 @@
             }
         };
 
-        const setupHotkeys = (player, notify) => {
+        const setupHotkeys = (player, notify, playlistNavRef) => {
             const { enableHotkeys, hotkeySeekStep } = C;
             if (!player || !enableHotkeys) return;
 
@@ -1187,6 +1351,27 @@
                         player.currentTime(player.currentTime() + hotkeySeekStep);
                         notify(player, `Forward ${hotkeySeekStep}s`, "info", 500);
                         break;
+                    // === 新增：↑ / ↓ 切换上一个 / 下一个视频 ===
+                    case 'ArrowUp':
+                        e.preventDefault(); e.stopPropagation();
+                        if (playlistNavRef && playlistNavRef.current) {
+                            const nav = playlistNavRef.current;
+                            if (nav.canNavigate && nav.canNavigate()) {
+                                const moved = nav.goPrev();
+                                if (moved) notify(player, "Previous Video", "info", 500);
+                            }
+                        }
+                        break;
+                    case 'ArrowDown':
+                        e.preventDefault(); e.stopPropagation();
+                        if (playlistNavRef && playlistNavRef.current) {
+                            const nav = playlistNavRef.current;
+                            if (nav.canNavigate && nav.canNavigate()) {
+                                const moved = nav.goNext();
+                                if (moved) notify(player, "Next Video", "info", 500);
+                            }
+                        }
+                        break;
                 }
             };
 
@@ -1202,6 +1387,8 @@
             const errorShownRef = React.useRef(false);
             const hevcTimeoutRef = React.useRef(null);
             const toggleBtnRef = React.useRef(null);
+            // 供 ↑/↓ 热键调用的播放列表导航能力
+            const playlistNavRef = React.useRef(null);
 
             const [conversionMode, setConversionMode] = React.useState(false);
             const isConvertingRef = React.useRef(false);
@@ -1209,6 +1396,23 @@
             const [overlayState, setOverlayState] = React.useState(null);
             const [dynamicPoster, setDynamicPoster] = React.useState(props.poster);
             const [playlistOpen, setPlaylistOpen] = React.useState(() => readPlaylistOpenState(false));
+            const [controlsLocked, setControlsLocked] = React.useState(() => {
+                try {
+                    return localStorage.getItem('vjs-controls-locked') === '1';
+                } catch {
+                    return false;
+                }
+            });
+
+            const toggleControlsLocked = React.useCallback(() => {
+                setControlsLocked(prev => {
+                    const next = !prev;
+                    try {
+                        localStorage.setItem('vjs-controls-locked', next ? '1' : '0');
+                    } catch {}
+                    return next;
+                });
+            }, []);
 
             const cssClasses = 'video-js vjs-big-play-centered';
 
@@ -1370,7 +1574,7 @@
                 playerRef.current = player;
 
                 setupMobileGestures(player, notify, videoElementRef);
-                setupHotkeys(player, notify);
+                setupHotkeys(player, notify, playlistNavRef);
 
                 const playerEl = player.el();
                 if (playerEl) playerEl.tabIndex = 0;
@@ -1776,6 +1980,21 @@
                 };
             }, [playlistOpen, props.src]);
 
+            // 控制栏锁定效果：当锁定开启且 playlist 打开时，强制 control bar 常显
+            React.useEffect(() => {
+                const player = playerRef.current;
+                if (!player || player.isDisposed()) return;
+                const playerEl = player.el();
+                if (!playerEl) return;
+
+                if (controlsLocked && playlistOpen) {
+                    playerEl.classList.add('vjs-controls-locked');
+                    player.userActive(true);
+                } else {
+                    playerEl.classList.remove('vjs-controls-locked');
+                }
+            }, [controlsLocked, playlistOpen]);
+
             if (!props.src) {
                 return h('div', { style: { width: '100%', height: '100%', minHeight: '150px', display: 'flex', alignItems: 'center', justifyContent: 'center', backgroundColor: '#000', color: '#666', fontFamily: 'sans-serif' } }, 'No Video Selected');
             }
@@ -1809,6 +2028,9 @@
                     playerRef: playerRef,
                     open: playlistOpen,
                     onClose: () => togglePlaylist(false),
+                    controlsLocked: controlsLocked,
+                    onToggleControlsLocked: toggleControlsLocked,
+                    onRegisterNav: (nav) => { playlistNavRef.current = nav; },
                 }),
             ]);
         });
