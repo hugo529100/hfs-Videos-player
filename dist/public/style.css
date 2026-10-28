@@ -1404,7 +1404,7 @@ video::-webkit-media-text-track-display {
 
 .vjs-playlist.is-open {
   width: 250px;
-  max-width: 26%;
+  max-width: 25%;
   opacity: 1; 
   pointer-events: auto;
 }
