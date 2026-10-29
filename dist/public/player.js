@@ -51,8 +51,21 @@
         const folderCache = new Map();
         const listScrollCache = new Map();
 
+        const playlistSnapshots = new Map();
+
+        let fileShowCloseObserver = null;
+        const ensureFileShowCloseObserver = () => {
+            if (fileShowCloseObserver) return;
+            fileShowCloseObserver = new MutationObserver(() => {
+                if (document.querySelectorAll('.file-show').length === 0 && playlistSnapshots.size > 0) {
+                    playlistSnapshots.clear();
+                }
+            });
+            fileShowCloseObserver.observe(document.body, { childList: true, subtree: true });
+        };
+
         // ============================================================
-        // === 内置 HFS File-Show 菜单操作（不依赖任何外部插件） ===
+        // === 内置 HFS File-Show 菜单操作 ===
         // ============================================================
         const MENU_BUTTON_SELECTOR = [
             '.dialog-backdrop.file-show button[title="Menu"]',
@@ -75,11 +88,9 @@
         }
 
         function getMenuButton() {
-            // 优先用 CSS 选择器
             const direct = document.querySelector(MENU_BUTTON_SELECTOR);
             if (direct) return direct;
 
-            // 回退：遍历按钮找 title/aria-label 含 "menu" 或含 .fa-menu 图标
             const candidates = document.querySelectorAll(
                 '.dialog-backdrop.file-show button, .dialog-backdrop.file-dialog button'
             );
@@ -194,10 +205,6 @@
             });
         }
 
-        /**
-         * 内置菜单点击：打开菜单 → 等待目标项 → 点击。
-         * 对 comment 会隐藏 file-dialog，避免与 comment 子对话框叠加。
-         */
         async function clickFileMenuItem(action, options = {}) {
             const {
                 openMenuIfNeeded = true,
@@ -243,6 +250,7 @@
         }
 
         ensureSubDialogObserver();
+        ensureFileShowCloseObserver();
 
         // ============================================================
         // === Helper: 中文数字解析 ===
@@ -262,7 +270,6 @@
             return null;
         };
 
-        // --- Helper: 从文件名提取 episode 标记（与 Visited-filename 插件一致） ---
         const extractEpisode = (name) => {
             if (!name) return null;
             let m = name.match(/s(\d+)e(\d+)/i);
@@ -327,7 +334,6 @@
             }
         };
 
-        // --- 統一的釋放函數：停止舊請求 + 清理 player 狀態 ---
         const releasePlayer = (player, videoEl) => {
             if (!player || player.isDisposed()) return;
             try {
@@ -348,6 +354,29 @@
             }
         };
 
+        const transferRef = {
+            player: null,
+            videoEl: null,
+            dialogEl: null,
+            transcoding: false,
+        };
+
+        const interruptCurrentTransfer = (reason = 'unknown') => {
+            const { player, videoEl, dialogEl } = transferRef;
+
+            if (player && !player.isDisposed()) {
+                releasePlayer(player, videoEl);
+            } else if (videoEl) {
+                hardBrakeVideo(videoEl);
+            }
+
+            if (dialogEl && dialogEl.parentNode) {
+                dialogEl.querySelectorAll('video').forEach(v => hardBrakeVideo(v));
+            }
+
+            transferRef.transcoding = false;
+        };
+
         const formatSize = (bytes) => {
             if (bytes == null || isNaN(bytes)) return '';
             if (bytes < 1024) return bytes + ' B';
@@ -358,7 +387,6 @@
             return (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + ' ' + units[i];
         };
 
-        // --- 碼率格式化：kbps / Mbps ---
         const formatBitrate = (bitsPerSec) => {
             if (!bitsPerSec || isNaN(bitsPerSec) || bitsPerSec <= 0) return '';
             const kbps = bitsPerSec / 1000;
@@ -460,10 +488,8 @@
             if (!dialogEl) return;
             try {
                 dialogEl.querySelectorAll('video').forEach(v => {
-                    try {
-                        v.muted = true;
-                        v.pause();
-                    } catch (e) {}
+                    try { v.muted = true; } catch (e) {}
+                    hardBrakeVideo(v);
                 });
             } catch (e) {
                 console.warn('[VideoJS] stopVideosIn failed:', e);
@@ -587,7 +613,6 @@
             try { localStorage.setItem('vjs-playlist-open', open ? '1' : '0'); } catch {}
         };
 
-        // --- 長按 / 雙擊當前播放檔案 → 呼出 comment（與播放切換完全獨立） ---
         const getCurrentFileShowName = () => {
             const bar = document.querySelector(
                 '.dialog-backdrop.file-show .bar .filename, ' +
@@ -610,10 +635,6 @@
             return getCurrentFileShowName() === item.name;
         };
 
-        /**
-         * 触发 comment：直接走内置 clickFileMenuItem。
-         * 不再依赖任何外部插件提供的 window.hfsMenuClick。
-         */
         const triggerCommentForItem = async (item) => {
             if (!isCurrentFileShow(item)) return false;
             try {
@@ -626,14 +647,9 @@
             }
         };
 
-        // 取得「當前播放檔位的編碼碼率」（bps），與網速無關。
-        // 優先：VHS qualityLevels 當前選中檔位的 bitrate；
-        // 退回：fileSize / duration × 8（單檔 Progressive）。
-        // 轉碼流（?ffmpeg）碼率未知，回傳 0 表示不顯示。
         const getCurrentBitrate = (player, items) => {
             if (!player || player.isDisposed()) return 0;
 
-            // 1) 自適應流：當前選中檔位的標稱碼率
             try {
                 const ql = player.qualityLevels && player.qualityLevels();
                 if (ql && ql.length) {
@@ -643,7 +659,6 @@
                 }
             } catch (e) {}
 
-            // 2) 單檔：fileSize / duration
             try {
                 const curSrc = player.currentSrc() || '';
                 if (/[?&]ffmpeg\b/.test(curSrc)) return 0;
@@ -666,9 +681,220 @@
             }
         };
 
+        const deriveItemsFromLock = (lock) => {
+            if (!lock) return [];
+            const out = [];
+            for (const name of lock.order) {
+                const it = lock.map[name];
+                if (it) out.push(it);
+            }
+            return out;
+        };
+
+        const patchLockFromHfsState = (folderUri, lock) => {
+            if (!lock) return false;
+            const hfsList = (window.HFS && window.HFS.state && window.HFS.state.list) || [];
+            if (!hfsList.length) return false;
+
+            const isVideo = (name) => {
+                if (!name) return false;
+                const ext = name.substring(name.lastIndexOf('.')).toLowerCase();
+                return VIDEO_EXTS.includes(ext)
+                    || (C.enableHLS && (ext === '.m3u8' || ext === '.mkv'));
+            };
+
+            const hfsByName = new Map();
+            hfsList.forEach(e => {
+                const n = e && (e.n || e.name);
+                if (n && isVideo(n)) hfsByName.set(n, e);
+            });
+
+            let changed = false;
+            const nextOrder = [];
+            for (const name of lock.order) {
+                if (hfsByName.has(name)) {
+                    nextOrder.push(name);
+                    const entry = hfsByName.get(name);
+                    const cur = lock.map[name];
+                    if (cur) {
+                        const newComment = (entry.comment !== undefined && entry.comment !== null && String(entry.comment).trim() !== '')
+                            ? String(entry.comment) : null;
+                        const newSize = (entry.s !== undefined && entry.s !== null) ? entry.s : cur.size;
+                        if (newComment !== cur.comment || newSize !== cur.size) {
+                            lock.map[name] = { ...cur, comment: newComment, size: newSize };
+                            changed = true;
+                        }
+                    }
+                } else {
+                    delete lock.map[name];
+                    changed = true;
+                }
+            }
+            if (nextOrder.length !== lock.order.length) {
+                lock.order = nextOrder;
+                changed = true;
+            }
+            if (changed) {
+                playlistSnapshots.set(folderUri, lock);
+            }
+            return changed;
+        };
+
+        const refreshSnapshotFromServer = async (folderUri) => {
+            if (!folderUri) return;
+            const lock = playlistSnapshots.get(folderUri);
+            if (!lock) return;
+
+            try {
+                const apiUrl = `/~/api/get_file_list?uri=${encodeURIComponent(folderUri)}&_t=${Date.now()}`;
+                const res = await fetch(apiUrl, {
+                    credentials: 'same-origin',
+                    headers: { 'Accept': 'application/json' },
+                    cache: 'no-store'
+                });
+                if (!res.ok) return;
+                const data = await res.json();
+                const list = data && data.list ? data.list : [];
+
+                const isVideo = (name) => {
+                    if (!name) return false;
+                    const ext = name.substring(name.lastIndexOf('.')).toLowerCase();
+                    return VIDEO_EXTS.includes(ext)
+                        || (C.enableHLS && (ext === '.m3u8' || ext === '.mkv'));
+                };
+
+                const byName = new Map();
+                list.forEach(it => {
+                    const n = it && (it.n || it.name);
+                    if (n && isVideo(n)) byName.set(n, it);
+                });
+
+                let changed = false;
+
+                const nextOrder = [];
+                for (const name of lock.order) {
+                    if (byName.has(name)) {
+                        nextOrder.push(name);
+                        const entry = byName.get(name);
+                        const cur = lock.map[name];
+                        if (cur) {
+                            const newComment = (entry.comment !== undefined && entry.comment !== null && String(entry.comment).trim() !== '')
+                                ? String(entry.comment) : null;
+                            const newSize = (entry.s !== undefined && entry.s !== null) ? entry.s : cur.size;
+                            if (newComment !== cur.comment || newSize !== cur.size) {
+                                lock.map[name] = { ...cur, comment: newComment, size: newSize };
+                                changed = true;
+                            }
+                        }
+                    } else {
+                        delete lock.map[name];
+                        changed = true;
+                    }
+                }
+                if (nextOrder.length !== lock.order.length) {
+                    lock.order = nextOrder;
+                    changed = true;
+                }
+
+                if (changed) {
+                    playlistSnapshots.set(folderUri, lock);
+                }
+                // ★ 无条件派发，让 PlaylistPanel 重渲染
+                window.dispatchEvent(new CustomEvent('vjs-playlist-refresh', { detail: { folderUri } }));
+            } catch (e) {
+                console.warn('[VideoJS] refreshSnapshotFromServer failed:', e);
+            }
+        };
+
+        // ============================================================
+        // ★ 通用：当前 file-show 的 folderUri
+        // ============================================================
+        const getCurrentFileShowFolderUri = () => {
+            const vid = document.querySelector('.file-show video.video-js, .file-show video.vjs-tech, .file-show video');
+            if (vid) {
+                const src = vid.currentSrc || vid.src || '';
+                if (src) return getFolderUri(src);
+            }
+            if (window.HFS && window.HFS.state && window.HFS.state.uri) {
+                const u = window.HFS.state.uri;
+                return u.endsWith('/') ? u : u + '/';
+            }
+            return '';
+        };
+
+        // ============================================================
+        // ★ 通用对话框关闭监听：任何动作型 dialog 消失 → 刷新
+        // ============================================================
+        let dialogCloseObserver = null;
+        const ensureDialogCloseObserver = () => {
+            if (dialogCloseObserver) return;
+
+            const countActionDialogs = () => {
+                let n = 0;
+                document.querySelectorAll('.dialog[aria-modal="true"]').forEach(d => {
+                    if (d.closest && d.closest('.file-show')) return;
+                    if (d.querySelector('textarea[name="input"]')) { n++; return; }
+                    if (d.querySelector('.dialog-content') && d.querySelectorAll('button').length >= 1) { n++; }
+                });
+                return n;
+            };
+
+            let hadActionDialog = countActionDialogs() > 0;
+
+            dialogCloseObserver = new MutationObserver(() => {
+                const nowHas = countActionDialogs() > 0;
+                if (hadActionDialog && !nowHas) {
+                    const fu = getCurrentFileShowFolderUri();
+                    if (fu) {
+                        setTimeout(() => { refreshSnapshotFromServer(fu); }, 300);
+                        setTimeout(() => { refreshSnapshotFromServer(fu); }, 800);
+                        setTimeout(() => { refreshSnapshotFromServer(fu); }, 2000);
+                    }
+                }
+                hadActionDialog = nowHas;
+            });
+
+            dialogCloseObserver.observe(document.body, { childList: true, subtree: true });
+        };
+
+        // ============================================================
+        // ★ HFS.state.list 轮询兜底（800ms 一次）
+        // ============================================================
+        let hfsStateWatch = null;
+        const ensureHfsStateWatch = () => {
+            if (hfsStateWatch) return;
+            let lastJson = '';
+
+            const check = () => {
+                const list = (window.HFS && window.HFS.state && window.HFS.state.list) || [];
+                if (!list.length) return;
+                const json = JSON.stringify(list.map(e => ({
+                    n: e && (e.n || e.name),
+                    c: (e && e.comment) || '',
+                    s: e && e.s
+                })));
+                if (lastJson && json !== lastJson) {
+                    const fu = getCurrentFileShowFolderUri();
+                    if (fu) {
+                        setTimeout(() => { refreshSnapshotFromServer(fu); }, 100);
+                        setTimeout(() => { refreshSnapshotFromServer(fu); }, 500);
+                    }
+                }
+                lastJson = json;
+            };
+
+            check();
+            hfsStateWatch = setInterval(check, 800);
+        };
+
         const PlaylistPanel = ({ src, playerRef, open, onClose, controlsLocked, onToggleControlsLocked, onRegisterNav }) => {
             const [items, setItems] = React.useState(() => {
                 const fu = getFolderUri(src);
+                const lock = fu && playlistSnapshots.get(fu);
+                if (lock) {
+                    patchLockFromHfsState(fu, lock);
+                    return deriveItemsFromLock(lock);
+                }
                 return fu && folderCache.has(fu) ? folderCache.get(fu) : [];
             });
             const [currentName, setCurrentName] = React.useState('');
@@ -679,13 +905,13 @@
             const listRef = React.useRef(null);
             const currentItemRef = React.useRef(null);
             const hasAutoScrolledRef = React.useRef(false);
-            const prevItemsRef = React.useRef([]);
             const autoAdvancingRef = React.useRef(false);
 
             const itemsRef = React.useRef(items);
             itemsRef.current = items;
 
-            // 長按手勢狀態
+            const syncScheduledRef = React.useRef(false);
+
             const gestureRef = React.useRef({
                 timer: null,
                 longPressed: false,
@@ -697,7 +923,32 @@
 
             const folderUri = getFolderUri(src);
 
-            // --- 碼率：讀當前檔位編碼碼率；切檔 / 加檔 / 清單更新時即時刷新 ---
+            React.useEffect(() => {
+                const onRefresh = (e) => {
+                    if (!e.detail || e.detail.folderUri !== folderUri) return;
+                    const lock = playlistSnapshots.get(folderUri);
+                    if (lock) setItems(deriveItemsFromLock(lock));
+                };
+                window.addEventListener('vjs-playlist-refresh', onRefresh);
+                return () => window.removeEventListener('vjs-playlist-refresh', onRefresh);
+            }, [folderUri]);
+
+            React.useEffect(() => {
+                if (!folderUri) return;
+                const lock = playlistSnapshots.get(folderUri);
+                if (!lock) return;
+
+                const apply = () => {
+                    const changed = patchLockFromHfsState(folderUri, lock);
+                    if (changed) setItems(deriveItemsFromLock(lock));
+                };
+
+                apply();
+                const t1 = setTimeout(apply, 50);
+                const t2 = setTimeout(apply, 200);
+                return () => { clearTimeout(t1); clearTimeout(t2); };
+            }, [folderUri, src]);
+
             React.useEffect(() => {
                 if (!open) return;
                 const player = playerRef.current;
@@ -710,13 +961,11 @@
 
                 updateBitrate();
 
-                // 播放器事件
                 player.on('loadedmetadata', updateBitrate);
                 player.on('durationchange', updateBitrate);
                 player.on('sourceset', updateBitrate);
                 player.on('loadstart', updateBitrate);
 
-                // qualityLevels 事件（切檔即時更新）
                 let ql = null;
                 const onQlChange = () => updateBitrate();
                 try {
@@ -742,10 +991,16 @@
                 };
             }, [open, src]);
 
-            // 列表拉取
             React.useEffect(() => {
                 let cancelled = false;
                 if (!folderUri) return;
+
+                const lock = playlistSnapshots.get(folderUri);
+                if (lock) {
+                    setItems(deriveItemsFromLock(lock));
+                    setLoading(false);
+                    return;
+                }
 
                 if (folderCache.has(folderUri)) {
                     setItems(folderCache.get(folderUri));
@@ -757,7 +1012,13 @@
                     if (cancelled) return;
                     fetchFolderVideos(folderUri, true).then(list => {
                         if (cancelled) return;
-                        setItems(list);
+                        if (!playlistSnapshots.has(folderUri)) {
+                            const order = list.map(it => it.name);
+                            const map = {};
+                            list.forEach(it => { map[it.name] = it; });
+                            playlistSnapshots.set(folderUri, { order, map });
+                        }
+                        setItems(deriveItemsFromLock(playlistSnapshots.get(folderUri)));
                         setLoading(false);
                     });
                 }, 150);
@@ -766,16 +1027,14 @@
                     cancelled = true;
                     clearTimeout(timer);
                 };
-            }, [folderUri, src]);
+            }, [folderUri]);
 
-            // 当前播放文件名
             React.useEffect(() => {
                 if (!src) return;
                 const name = getCurrentFilename(playerRef.current, src);
                 if (name) setCurrentName(name);
             }, [src]);
 
-            // 播放器事件同步高亮
             React.useEffect(() => {
                 const player = playerRef && playerRef.current;
                 if (!player || player.isDisposed()) return;
@@ -797,7 +1056,6 @@
                 };
             }, [src]);
 
-            // --- 播放结束自动连播下一个（完整列表循环） ---
             React.useEffect(() => {
                 const player = playerRef && playerRef.current;
                 if (!player || player.isDisposed()) return;
@@ -835,7 +1093,6 @@
                 };
             }, [items, src]);
 
-            // 僅在「首次進入 fileShow」時自動滾動定位到當前播放項。
             React.useLayoutEffect(() => {
                 if (!open || !folderUri) return;
                 if (hasAutoScrolledRef.current) return;
@@ -861,14 +1118,12 @@
                 hasAutoScrolledRef.current = true;
             }, [open, folderUri, items, src]);
 
-            // 面板關閉時重置「首次滾動」標記
             React.useEffect(() => {
                 if (!open) {
                     hasAutoScrolledRef.current = false;
                 }
             }, [open]);
 
-            // 监听滚动，实时记录位置
             React.useEffect(() => {
                 if (!open || !folderUri) return;
                 const el = listRef.current;
@@ -883,56 +1138,128 @@
                 };
             }, [open, folderUri]);
 
-            // --- 刪除當前播放文件後的自動銜接 ---
             React.useEffect(() => {
-                const prev = prevItemsRef.current;
-                const curr = items;
-                if (!prev.length) {
-                    prevItemsRef.current = curr;
-                    return;
-                }
+                if (!folderUri) return;
 
-                const currentFilename = getCurrentFilename(playerRef.current, src);
-                if (!currentFilename) {
-                    prevItemsRef.current = curr;
-                    return;
-                }
+                const syncList = () => {
+                    const lock = playlistSnapshots.get(folderUri);
+                    if (!lock) return;
 
-                const existedBefore = prev.some(it => it.name === currentFilename);
-                const existsNow = curr.some(it => it.name === currentFilename);
+                    const hfsList = (window.HFS && window.HFS.state && window.HFS.state.list) || [];
+                    if (!hfsList.length) return;
 
-                if (existedBefore && !existsNow && !autoAdvancingRef.current) {
-                    const player = playerRef.current;
-                    if (!player || player.isDisposed()) {
-                        prevItemsRef.current = curr;
+                    const isVideo = (name) => {
+                        if (!name) return false;
+                        const ext = name.substring(name.lastIndexOf('.')).toLowerCase();
+                        return VIDEO_EXTS.includes(ext)
+                            || (C.enableHLS && (ext === '.m3u8' || ext === '.mkv'));
+                    };
+
+                    const hfsByName = new Map();
+                    hfsList.forEach(e => {
+                        const n = e && (e.n || e.name);
+                        if (n && isVideo(n)) hfsByName.set(n, e);
+                    });
+
+                    const prevOrder = lock.order;
+                    const nextOrder = [];
+                    let removedAny = false;
+                    let removedCurrent = false;
+                    const currentFilename = getCurrentFilename(playerRef.current, src);
+
+                    for (const name of prevOrder) {
+                        if (hfsByName.has(name)) {
+                            nextOrder.push(name);
+                            const entry = hfsByName.get(name);
+                            const cur = lock.map[name];
+                            if (cur) {
+                                const newComment = (entry.comment !== undefined && entry.comment !== null && String(entry.comment).trim() !== '')
+                                    ? String(entry.comment) : null;
+                                const newSize = (entry.s !== undefined && entry.s !== null) ? entry.s : cur.size;
+                                if (newComment !== cur.comment || newSize !== cur.size) {
+                                    lock.map[name] = { ...cur, comment: newComment, size: newSize };
+                                }
+                            }
+                        } else {
+                            removedAny = true;
+                            if (name === currentFilename) removedCurrent = true;
+                            delete lock.map[name];
+                        }
+                    }
+
+                    if (!removedAny) {
+                        playlistSnapshots.set(folderUri, lock);
                         return;
                     }
 
-                    releasePlayer(player);
+                    lock.order = nextOrder;
+                    playlistSnapshots.set(folderUri, lock);
+                    setItems(deriveItemsFromLock(lock));
 
-                    const oldIdx = prev.findIndex(it => it.name === currentFilename);
-                    const nextItem = curr[oldIdx] || curr[curr.length - 1] || null;
+                    refreshSnapshotFromServer(folderUri);
 
-                    if (nextItem) {
-                        autoAdvancingRef.current = true;
-                        requestAnimationFrame(() => {
-                            requestAnimationFrame(() => {
-                                try {
-                                    handleSelectRef.current && handleSelectRef.current(nextItem);
-                                } finally {
-                                    autoAdvancingRef.current = false;
+                    if (removedCurrent && !autoAdvancingRef.current) {
+                        const player = playerRef.current;
+                        if (player && !player.isDisposed() && currentFilename) {
+                            releasePlayer(player);
+                            const oldIdx = prevOrder.indexOf(currentFilename);
+                            let nextItem = null;
+                            for (let i = oldIdx + 1; i < prevOrder.length; i++) {
+                                const nm = prevOrder[i];
+                                if (lock.map[nm]) { nextItem = lock.map[nm]; break; }
+                            }
+                            if (!nextItem) {
+                                for (let i = prevOrder.length - 1; i >= 0; i--) {
+                                    const nm = prevOrder[i];
+                                    if (lock.map[nm]) { nextItem = lock.map[nm]; break; }
                                 }
-                            });
-                        });
-                    } else {
-                        setCurrentName('');
+                            }
+
+                            if (nextItem) {
+                                autoAdvancingRef.current = true;
+                                requestAnimationFrame(() => requestAnimationFrame(() => {
+                                    try {
+                                        handleSelectRef.current && handleSelectRef.current(nextItem);
+                                    } finally {
+                                        autoAdvancingRef.current = false;
+                                    }
+                                }));
+                            } else {
+                                setCurrentName('');
+                            }
+                        }
                     }
+                };
+
+                const scheduleSync = () => {
+                    if (syncScheduledRef.current) return;
+                    syncScheduledRef.current = true;
+                    requestAnimationFrame(() => {
+                        syncScheduledRef.current = false;
+                        syncList();
+                    });
+                };
+
+                scheduleSync();
+
+                let observer = null;
+                const listEl = document.querySelector('.list');
+                if (listEl) {
+                    observer = new MutationObserver(scheduleSync);
+                    observer.observe(listEl, { childList: true, subtree: true });
                 }
 
-                prevItemsRef.current = curr;
-            }, [items, src]);
+                const interval = setInterval(scheduleSync, 2500);
+
+                return () => {
+                    if (observer) observer.disconnect();
+                    clearInterval(interval);
+                };
+            }, [folderUri]);
 
             const handleSelectRef = React.useRef(null);
+
+            const switchingRef = React.useRef(false);
 
             const handleSelect = (item, forcePlay = false) => {
                 const player = playerRef && playerRef.current;
@@ -943,9 +1270,24 @@
                 })();
                 if (decodeURI(item.url) === playerSrc) return;
 
+                if (switchingRef.current) {
+                    transferRef.player = player;
+                    transferRef.videoEl = player.el()
+                        ? player.el().querySelector('video.video-js, video.vjs-tech, .video-js video')
+                        : null;
+                    interruptCurrentTransfer('rapid-click');
+                    return;
+                }
+                switchingRef.current = true;
+
                 const wasPlaying = forcePlay || !player.paused();
 
-                releasePlayer(player);
+                transferRef.player = player;
+                transferRef.videoEl = player.el()
+                    ? player.el().querySelector('video.video-js, video.vjs-tech, .video-js video')
+                    : null;
+                transferRef.dialogEl = null;
+                interruptCurrentTransfer('playlist-select');
 
                 if (isWrapperFullscreen()) {
                     player.src({ src: item.url, type: determineMimeType(item.url) });
@@ -955,6 +1297,9 @@
                     }
                     syncHfsFileShowBar(item);
                     setCurrentName(item.name);
+                    requestAnimationFrame(() => requestAnimationFrame(() => {
+                        setTimeout(() => { switchingRef.current = false; }, 300);
+                    }));
                     return;
                 }
 
@@ -967,6 +1312,9 @@
                     }
                     syncHfsFileShowBar(item);
                     setCurrentName(item.name);
+                    requestAnimationFrame(() => requestAnimationFrame(() => {
+                        setTimeout(() => { switchingRef.current = false; }, 300);
+                    }));
                     return;
                 }
 
@@ -984,6 +1332,9 @@
                     }
                     syncHfsFileShowBar(item);
                     setCurrentName(item.name);
+                    requestAnimationFrame(() => requestAnimationFrame(() => {
+                        setTimeout(() => { switchingRef.current = false; }, 300);
+                    }));
                     return;
                 }
 
@@ -991,6 +1342,9 @@
                     requestAnimationFrame(() => {
                         const all = Array.from(document.querySelectorAll('.file-show'));
                         const newest = all[all.length - 1];
+
+                        transferRef.dialogEl = newest || null;
+
                         oldDialogs.forEach(d => {
                             if (d !== newest && d.parentNode) closeWithFade(d, 180, 220);
                         });
@@ -1000,18 +1354,21 @@
                             if (newVideoEl) {
                                 const newPlayer = videojs.getPlayer(newVideoEl);
                                 if (newPlayer && !newPlayer.isDisposed()) {
+                                    transferRef.player = newPlayer;
+                                    transferRef.videoEl = newVideoEl;
                                     const playPromise = newPlayer.play();
                                     if (playPromise && playPromise.catch) playPromise.catch(() => {});
                                 }
                             }
                         }
+
+                        setTimeout(() => { switchingRef.current = false; }, 300);
                     });
                 });
             };
 
             handleSelectRef.current = handleSelect;
 
-            // --- 向父组件注册 prev/next 导航能力（供键盘 ↑/↓ 使用） ---
             React.useEffect(() => {
                 if (!onRegisterNav) return;
                 onRegisterNav({
@@ -1043,7 +1400,6 @@
                 });
             }, [items, src, onRegisterNav]);
 
-            // === 長按 / 雙擊手勢：只對當前播放中的檔案觸發 comment ===
             const clearGestureTimer = () => {
                 if (gestureRef.current.timer) {
                     clearTimeout(gestureRef.current.timer);
@@ -1058,7 +1414,6 @@
                     gestureRef.current.timer = null;
                     gestureRef.current.longPressed = true;
 
-                    // 只有當前播放中的檔案才觸發 comment，其他檔案不動作
                     if (isCurrentFileShow(item)) {
                         triggerCommentForItem(item);
                     }
@@ -1087,7 +1442,6 @@
                 gestureRef.current.longPressed = false;
             };
 
-            // 雙擊：只對當前播放中的檔案觸發 comment
             const onItemDoubleClick = (item, e) => {
                 e.preventDefault();
                 e.stopPropagation();
@@ -1097,7 +1451,6 @@
                 }
             };
 
-            // 左側顯示：文件數/當前排位數
             const currentIndex = (() => {
                 if (!items.length || !currentName) return 0;
                 const idx = items.findIndex(it => it.name === currentName);
@@ -1351,7 +1704,6 @@
                         player.currentTime(player.currentTime() + hotkeySeekStep);
                         notify(player, `Forward ${hotkeySeekStep}s`, "info", 500);
                         break;
-                    // === 新增：↑ / ↓ 切换上一个 / 下一个视频 ===
                     case 'ArrowUp':
                         e.preventDefault(); e.stopPropagation();
                         if (playlistNavRef && playlistNavRef.current) {
@@ -1387,7 +1739,6 @@
             const errorShownRef = React.useRef(false);
             const hevcTimeoutRef = React.useRef(null);
             const toggleBtnRef = React.useRef(null);
-            // 供 ↑/↓ 热键调用的播放列表导航能力
             const playlistNavRef = React.useRef(null);
 
             const [conversionMode, setConversionMode] = React.useState(false);
@@ -1447,6 +1798,11 @@
                     const d = player.duration();
                     if (d && d > 0 && d !== Infinity) window._vjs_saved_duration = d;
                     isConvertingRef.current = true;
+                    transferRef.transcoding = true;
+                    transferRef.player = player;
+                    transferRef.videoEl = player.el()
+                        ? player.el().querySelector('video.video-js, video.vjs-tech, .video-js video')
+                        : null;
                     setConversionMode(true);
                     return;
                 }
@@ -1572,6 +1928,9 @@
                     poster: dynamicPoster
                 });
                 playerRef.current = player;
+
+                transferRef.player = player;
+                transferRef.videoEl = videoElement;
 
                 setupMobileGestures(player, notify, videoElementRef);
                 setupHotkeys(player, notify, playlistNavRef);
@@ -1807,12 +2166,10 @@
             React.useEffect(() => {
                 if (prevSrcRef.current && prevSrcRef.current !== props.src) {
                     console.log('[VideoJS] Braking old source:', prevSrcRef.current, '->', props.src);
-                    const player = playerRef.current;
-                    if (player && !player.isDisposed()) {
-                        releasePlayer(player, videoElementRef.current);
-                    } else {
-                        hardBrakeVideo(videoElementRef.current);
-                    }
+                    transferRef.player = playerRef.current;
+                    transferRef.videoEl = videoElementRef.current;
+                    transferRef.dialogEl = null;
+                    interruptCurrentTransfer('src-change');
                 }
                 prevSrcRef.current = props.src;
             }, [props.src]);
@@ -1824,6 +2181,7 @@
                     if (currentSrc && !decodeURI(currentSrc).includes(decodeURI(props.src))) {
                         setConversionMode(false);
                         isConvertingRef.current = false;
+                        transferRef.transcoding = false;
                         setSeekOffset(0);
                         hasResumedRef.current = false;
                     }
@@ -1882,6 +2240,13 @@
                         }
                         const targetTime = parseFloat(time);
                         if (targetTime >= 0) {
+                            if (transferRef.transcoding) {
+                                transferRef.player = player;
+                                transferRef.videoEl = player.el()
+                                    ? player.el().querySelector('video.video-js, video.vjs-tech, .video-js video')
+                                    : null;
+                                interruptCurrentTransfer('transcode-seek-pending');
+                            }
                             clearTimeout(seekDebounce);
                             seekDebounce = setTimeout(() => {
                                 let newOffset = targetTime;
@@ -1980,7 +2345,6 @@
                 };
             }, [playlistOpen, props.src]);
 
-            // 控制栏锁定效果：当锁定开启且 playlist 打开时，强制 control bar 常显
             React.useEffect(() => {
                 const player = playerRef.current;
                 if (!player || player.isDisposed()) return;
@@ -2051,6 +2415,9 @@
         if (typeof window !== 'undefined' && !window.VideoJsPlayer) {
             window.VideoJsPlayer = VideoJsPlayer;
         }
+
+        ensureDialogCloseObserver();
+        ensureHfsStateWatch();
 
     } else {
         console.error("VideoJS Plugin: React/Preact not found on window or HFS. Plugin execution aborted.");
