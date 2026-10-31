@@ -644,7 +644,7 @@ body.vjs-full-window {
   -moz-user-select: none;
   user-select: none;
   background-color: var(--ghost-contrast) !important;
-  backdrop-filter: blur(1px);
+  backdrop-filter: none;
 }
 
 .video-js .vjs-slider.disabled {
@@ -1387,7 +1387,7 @@ video::-webkit-media-text-track-display {
   -webkit-tap-highlight-color: transparent;
   flex: 0 0 auto;
   background: rgba(0, 0, 0, 0.603);
-  backdrop-filter: blur(2px);
+  backdrop-filter: none;
   display: flex;
   flex-direction: column;
   overflow: hidden;
