@@ -255,63 +255,188 @@
         // ============================================================
         // === Helper: 中文数字解析 ===
         // ============================================================
-        const parseChineseNum = (str) => {
-            if (/^\d+$/.test(str)) return parseInt(str);
-            const map = { '零':0,'一':1,'二':2,'三':3,'四':4,'五':5,'六':6,'七':7,'八':8,'九':9,'十':10 };
-            if (map[str] !== undefined) return map[str];
-            let m = str.match(/^([二三四五六七八九]?十)?([一二三四五六七八九])?$/);
-            if (m) {
-                let result = 0;
-                if (m[1]) result += map[m[1][0]] * 10;
-                else if (m[2] && !m[1]) return map[m[2]];
-                if (m[2]) result += map[m[2]];
-                return result;
-            }
+const parseChineseNum = (str) => {
+    if (str == null) return null;
+    str = String(str).trim();
+    if (/^\d+$/.test(str)) return parseInt(str, 10);
+
+    const digitMap = {
+        '零': 0, '〇': 0,
+        '一': 1, '壹': 1,
+        '二': 2, '贰': 2, '两': 2,
+        '三': 3, '叁': 3,
+        '四': 4, '肆': 4,
+        '五': 5, '伍': 5,
+        '六': 6, '陆': 6,
+        '七': 7, '柒': 7,
+        '八': 8, '捌': 8,
+        '九': 9, '玖': 9,
+    };
+    const unitMap = { '十': 10, '拾': 10, '百': 100, '佰': 100, '千': 1000, '仟': 1000 };
+
+    // 纯单位（十、百、千 单独出现 → 视为 1 个单位？一般不会，返回 null）
+    if (str.length === 1 && digitMap[str] !== undefined) return digitMap[str];
+
+    // 通用解析：支持 "十一" "二十三" "一百零五" "三百二十" 等
+    let total = 0;
+    let section = 0;
+    let currentDigit = 0;
+    let lastWasUnit = false;
+    let hasAny = false;
+
+    for (const ch of str) {
+        if (digitMap[ch] !== undefined) {
+            currentDigit = digitMap[ch];
+            lastWasUnit = false;
+            hasAny = true;
+        } else if (unitMap[ch] !== undefined) {
+            const unit = unitMap[ch];
+            if (currentDigit === 0 && !lastWasUnit) currentDigit = 1; // "十一" 的 "十"
+            section += currentDigit * unit;
+            currentDigit = 0;
+            lastWasUnit = true;
+            hasAny = true;
+        } else {
+            // 混入非数字字符，放弃
             return null;
-        };
+        }
+    }
+    if (currentDigit > 0 || section > 0) total = section + currentDigit;
+    if (!hasAny) return null;
+    return total;
+};
 
-        const extractEpisode = (name) => {
-            if (!name) return null;
-            let m = name.match(/s(\d+)e(\d+)/i);
-            if (m) return 'S' + parseInt(m[1]) + '-E' + parseInt(m[2]);
+const pad2 = (n) => String(n).padStart(2, '0');
 
-            m = name.match(/(?:第)?\s*(\d+|[一二三四五六七八九十]+)\s*季\s*(?:第)?\s*(\d+|[一二三四五六七八九十]+)\s*集/);
-            if (m) {
-                const s = parseChineseNum(m[1]);
-                const e = parseChineseNum(m[2]);
-                if (s !== null && e !== null) return 'S' + s + '-E' + e;
+const extractEpisode = (name) => {
+    if (!name) return null;
+    const base = name.replace(/\.[^.]+$/, ''); // 去扩展名，避免把 ".mp4" 里没有数字
+    const CN = '[0-9零〇一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]+';
+
+    // 1) SxxExx（英文，已自带格式；这里统一归一化补零）
+    let m = base.match(/s\s*(\d+)\s*e\s*(\d+)/i);
+    if (m) {
+        return 'S' + pad2(parseInt(m[1], 10)) + 'E' + pad2(parseInt(m[2], 10));
+    }
+
+    // 2) 第X季 第Y集（含中文数字，可有可无"第"）
+    //    覆盖：第一季第一集 / 第1季第1集 / 第一季 1集 / 1季1集
+    m = base.match(
+        new RegExp('第?\\s*(' + CN + ')\\s*季\\s*(?:第\\s*)?(' + CN + ')\\s*集')
+    );
+    if (m) {
+        const s = parseChineseNum(m[1]);
+        const e = parseChineseNum(m[2]);
+        if (s !== null && e !== null) {
+            return 'S' + pad2(s) + 'E' + pad2(e);
+        }
+    }
+
+    // 3) 只有 第X集（含中文数字）
+    m = base.match(new RegExp('第?\\s*(' + CN + ')\\s*集'));
+    if (m) {
+        const e = parseChineseNum(m[1]);
+        if (e !== null) return 'E' + pad2(e);
+    }
+
+    // 4) 第X话 / 話（日漫常见），视作集
+    m = base.match(new RegExp('第?\\s*(' + CN + ')\\s*[话話]'));
+    if (m) {
+        const e = parseChineseNum(m[1]);
+        if (e !== null) return 'E' + pad2(e);
+    }
+
+// 5a) 第X期（强约束：必须带"第"）
+m = base.match(new RegExp('第\\s*(' + CN + ')\\s*期'));
+if (m) {
+    const p = parseChineseNum(m[1]);
+    if (p !== null) return 'P-' + pad2(p);
+}
+
+// 5b) 第X部/章/节/節/篇/卷/回（中文必须带"第"）
+m = base.match(new RegExp('第\\s*(' + CN + ')\\s*(部|章|节|節|篇|卷|回)'));
+if (m) {
+    const p = parseChineseNum(m[1]);
+    if (p !== null) return 'P-' + pad2(p);
+}
+
+// 5c) 阿拉伯数字 + 单位（无"第"也可），不含"期"
+m = base.match(/(\d+)\s*(部|章|节|節|篇|卷|回)/);
+if (m) return 'P-' + pad2(+m[1]);
+
+    // 6) part N
+    m = base.match(/part\s*(\d+)/i);
+    if (m) return 'P-' + pad2(parseInt(m[1], 10));
+
+    return null;
+};
+
+const extractNumberTokens = (name) => {
+    if (!name) return [];
+    const base = name.replace(/\.[^.]+$/, ''); // 去掉扩展名
+
+    const tokens = [];
+    const seenRanges = []; // 记录已消耗的字符区间，避免重复提取
+
+    const overlaps = (start, end) => seenRanges.some(([s, e]) => start < e && end > s);
+
+    // 1) S01E02 形式
+    {
+        const re = /s(\d+)\s*e(\d+)/gi;
+        let m;
+        while ((m = re.exec(base))) {
+            if (overlaps(m.index, m.index + m[0].length)) continue;
+            tokens.push({ idx: m.index, order: tokens.length, val: parseInt(m[1], 10) });
+            tokens.push({ idx: m.index, order: tokens.length, val: parseInt(m[2], 10) });
+            seenRanges.push([m.index, m.index + m[0].length]);
+        }
+    }
+
+    // 2) 第 X 季 / 第 X 集 / 第 X 话 / 第 X 章 / 第 X 部 / 第 X 卷 / 第 X 回 / 第 X 期
+    {
+        const re = /第\s*([0-9零〇一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]+)\s*(季|集|话|話|章|部|卷|回|期|篇|节|節)/g;
+        let m;
+        while ((m = re.exec(base))) {
+            if (overlaps(m.index, m.index + m[0].length)) continue;
+            const n = parseChineseNum(m[1]);
+            if (n !== null) {
+                tokens.push({ idx: m.index, order: tokens.length, val: n });
+                seenRanges.push([m.index, m.index + m[0].length]);
             }
+        }
+    }
 
-            m = name.match(/(?:第)?\s*(\d+|[一二三四五六七八九十]+)\s*季\s*(\d+)\s*(?:集)?/);
-            if (m) {
-                const s = parseChineseNum(m[1]);
-                const e = parseInt(m[2]);
-                if (s !== null) return 'S' + s + '-E' + e;
+    // 3) 季 X 集 Y（无"第"字，如 "1季3集"）
+    {
+        const re = /(\d+|[一二两三四五六七八九十]+)\s*季\s*(\d+|[一二两三四五六七八九十]+)\s*集/g;
+        let m;
+        while ((m = re.exec(base))) {
+            if (overlaps(m.index, m.index + m[0].length)) continue;
+            const s = parseChineseNum(m[1]);
+            const e = parseChineseNum(m[2]);
+            if (s !== null && e !== null) {
+                tokens.push({ idx: m.index, order: tokens.length, val: s });
+                tokens.push({ idx: m.index, order: tokens.length, val: e });
+                seenRanges.push([m.index, m.index + m[0].length]);
             }
+        }
+    }
 
-            m = name.match(/第\s*(.+?)\s*集/);
-            if (m) {
-                const e = parseChineseNum(m[1]);
-                if (e !== null) return 'E' + e;
-            }
+    // 4) 裸阿拉伯数字（补漏，把所有未被上面捕获的数字 token 纳入，按出现顺序）
+    {
+        const re = /\d+/g;
+        let m;
+        while ((m = re.exec(base))) {
+            if (overlaps(m.index, m.index + m[0].length)) continue;
+            tokens.push({ idx: m.index, order: tokens.length, val: parseInt(m[0], 10) });
+            seenRanges.push([m.index, m.index + m[0].length]);
+        }
+    }
 
-            m = name.match(/第\s*(.+?)\s*(?:部|章|节|篇|卷)/);
-            if (m) {
-                const p = parseChineseNum(m[1]);
-                if (p !== null) return 'P-' + p;
-            }
-
-            m = name.match(/part\s*(\d+)/i);
-            if (m) return 'P-' + parseInt(m[1]);
-            return null;
-        };
-
-        const extractNumberTokens = (name) => {
-            if (!name) return [];
-            const base = name.replace(/\.[^.]+$/, '');
-            const nums = base.match(/\d+/g);
-            return nums ? nums.map(Number) : [];
-        };
+    // 按出现位置排序，取 val 列表
+    tokens.sort((a, b) => (a.idx - b.idx) || (a.order - b.order));
+    return tokens.map(t => t.val);
+};
 
         const extractDateToken = (name) => {
             if (!name) return null;
@@ -337,23 +462,84 @@
             return null;
         };
 
-        const compareByNumbersThenDate = (a, b) => {
-            const na = extractNumberTokens(a.name);
-            const nb = extractNumberTokens(b.name);
-            const len = Math.min(na.length, nb.length);
-            for (let i = 0; i < len; i++) {
-                if (na[i] !== nb[i]) return na[i] - nb[i];
-            }
-            if (na.length !== nb.length) return na.length - nb.length;
+const extractGroupKey = (name) => {
+    if (!name) return '';
+    const base = name.replace(/\.[^.]+$/, ''); // 去扩展名
 
-            const da = extractDateToken(a.name);
-            const db = extractDateToken(b.name);
-            if (da !== null && db !== null && da !== db) return da - db;
-            if (da !== null && db === null) return -1;
-            if (da === null && db !== null) return 1;
+    // 复用 token 提取逻辑得到 "起始位置"
+    // 但 extractNumberTokens 只返回数值，不返回位置。
+    // 所以这里单独计算 "第一个数字语义起点"。
 
-            return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
-        };
+    let firstIdx = -1;
+
+    const consider = (idx) => {
+        if (idx < 0) return;
+        if (firstIdx < 0 || idx < firstIdx) firstIdx = idx;
+    };
+
+    // SxxExx
+    {
+        const m = base.match(/s\d+\s*e\d+/i);
+        if (m) consider(m.index);
+    }
+
+    // 第X集/季/... (含中文数字)
+    {
+        const m = base.match(/第\s*[0-9零〇一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]+\s*(季|集|话|話|章|部|卷|回|期|篇|节|節)/);
+        if (m) consider(m.index);
+    }
+
+    // X季Y集
+    {
+        const m = base.match(/[0-9一二两三四五六七八九十]+\s*季\s*[0-9一二两三四五六七八九十]+\s*集/);
+        if (m) consider(m.index);
+    }
+
+    // 纯阿拉伯数字
+    {
+        const m = base.match(/\d+/);
+        if (m) consider(m.index);
+    }
+
+    // part N
+    {
+        const m = base.match(/part\s*\d+/i);
+        if (m) consider(m.index);
+    }
+
+    if (firstIdx < 0) return base.trim(); // 没有数字 → 整个文件名当 groupKey
+    return base.substring(0, firstIdx).trim();
+};
+
+const compareByNumbersThenDate = (a, b) => {
+    // 1) 先按前标题分组
+    const ga = extractGroupKey(a.name);
+    const gb = extractGroupKey(b.name);
+    if (ga !== gb) {
+        // 用 localeCompare 但 numeric:false，避免 groupKey 内部数字被特殊处理
+        const cmp = ga.localeCompare(gb, undefined, { numeric: false, sensitivity: 'base' });
+        if (cmp !== 0) return cmp;
+    }
+
+    // 2) 组内按数字序列
+    const na = extractNumberTokens(a.name);
+    const nb = extractNumberTokens(b.name);
+    const len = Math.min(na.length, nb.length);
+    for (let i = 0; i < len; i++) {
+        if (na[i] !== nb[i]) return na[i] - nb[i];
+    }
+    if (na.length !== nb.length) return na.length - nb.length;
+
+    // 3) 日期
+    const da = extractDateToken(a.name);
+    const db = extractDateToken(b.name);
+    if (da !== null && db !== null && da !== db) return da - db;
+    if (da !== null && db === null) return -1;
+    if (da === null && db !== null) return 1;
+
+    // 4) 全文
+    return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+};
 
         function determineMimeType(src) {
             if (src.startsWith('blob:') || src.startsWith('data:')) return 'video/mp4';
