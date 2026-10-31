@@ -306,6 +306,55 @@
             return null;
         };
 
+        const extractNumberTokens = (name) => {
+            if (!name) return [];
+            const base = name.replace(/\.[^.]+$/, '');
+            const nums = base.match(/\d+/g);
+            return nums ? nums.map(Number) : [];
+        };
+
+        const extractDateToken = (name) => {
+            if (!name) return null;
+            const base = name.replace(/\.[^.]+$/, '');
+            let m = base.match(/(?:^|[^\d])(\d{6})(?:[^\d]|$)/);
+            if (m) {
+                const s = m[1];
+                const yy = parseInt(s.slice(0, 2), 10);
+                const mm = parseInt(s.slice(2, 4), 10);
+                const dd = parseInt(s.slice(4, 6), 10);
+                if (mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31) return yy * 10000 + mm * 100 + dd;
+            }
+            m = base.match(/(?:^|[^\d])(\d{8})(?:[^\d]|$)/);
+            if (m) {
+                const s = m[1];
+                const yyyy = parseInt(s.slice(0, 4), 10);
+                const mm = parseInt(s.slice(4, 6), 10);
+                const dd = parseInt(s.slice(6, 8), 10);
+                if (mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31) return yyyy * 10000 + mm * 100 + dd;
+            }
+            m = base.match(/(\d{4})[-_.](\d{1,2})[-_.](\d{1,2})/);
+            if (m) return parseInt(m[1], 10) * 10000 + parseInt(m[2], 10) * 100 + parseInt(m[3], 10);
+            return null;
+        };
+
+        const compareByNumbersThenDate = (a, b) => {
+            const na = extractNumberTokens(a.name);
+            const nb = extractNumberTokens(b.name);
+            const len = Math.min(na.length, nb.length);
+            for (let i = 0; i < len; i++) {
+                if (na[i] !== nb[i]) return na[i] - nb[i];
+            }
+            if (na.length !== nb.length) return na.length - nb.length;
+
+            const da = extractDateToken(a.name);
+            const db = extractDateToken(b.name);
+            if (da !== null && db !== null && da !== db) return da - db;
+            if (da !== null && db === null) return -1;
+            if (da === null && db !== null) return 1;
+
+            return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+        };
+
         function determineMimeType(src) {
             if (src.startsWith('blob:') || src.startsWith('data:')) return 'video/mp4';
             const cleanSrc = src.split('?')[0];
@@ -901,6 +950,30 @@
             const [loading, setLoading] = React.useState(false);
             const [bitrate, setBitrate] = React.useState(0);
 
+            // ============================================================
+            // === 持久化排序模式（☰ 默认 / Ⅲ 数字强制排序） ===
+            // ============================================================
+            const readSortMode = () => {
+                try {
+                    return localStorage.getItem('vjs-playlist-sort') === 'num';
+                } catch {
+                    return false;
+                }
+            };
+            const writeSortMode = (on) => {
+                try { localStorage.setItem('vjs-playlist-sort', on ? 'num' : 'default'); } catch {}
+            };
+
+            const [forceNumericSort, setForceNumericSort] = React.useState(readSortMode);
+            const [sortSwitching, setSortSwitching] = React.useState(false);
+            const sortSwitchTimerRef = React.useRef(null);
+
+            React.useEffect(() => {
+                return () => {
+                    if (sortSwitchTimerRef.current) clearTimeout(sortSwitchTimerRef.current);
+                };
+            }, []);
+
             const panelRef = React.useRef(null);
             const listRef = React.useRef(null);
             const currentItemRef = React.useRef(null);
@@ -909,6 +982,14 @@
 
             const itemsRef = React.useRef(items);
             itemsRef.current = items;
+
+            // 派生：按当前排序模式生成的列表（默认顺序 = items 原顺序）
+            const sortedItems = React.useMemo(() => {
+                if (!forceNumericSort) return items;
+                return [...items].sort(compareByNumbersThenDate);
+            }, [items, forceNumericSort]);
+            const sortedItemsRef = React.useRef(sortedItems);
+            sortedItemsRef.current = sortedItems;
 
             const syncScheduledRef = React.useRef(false);
 
@@ -1062,15 +1143,15 @@
 
                 const handleEnded = () => {
                     if (autoAdvancingRef.current) return;
-                    if (!items.length) return;
+                    if (!sortedItems.length) return;
 
                     const currentFilename = getCurrentFilename(player, src);
                     if (!currentFilename) return;
 
-                    const idx = items.findIndex(it => it.name === currentFilename);
+                    const idx = sortedItems.findIndex(it => it.name === currentFilename);
                     if (idx < 0) return;
 
-                    const nextItem = items[(idx + 1) % items.length];
+                    const nextItem = sortedItems[(idx + 1) % sortedItems.length];
                     if (!nextItem) return;
 
                     autoAdvancingRef.current = true;
@@ -1091,12 +1172,13 @@
                     if (!player || player.isDisposed()) return;
                     player.off('ended', handleEnded);
                 };
-            }, [items, src]);
+            }, [sortedItems, src]);
 
             React.useLayoutEffect(() => {
                 if (!open || !folderUri) return;
+                if (sortSwitching) return;
                 if (hasAutoScrolledRef.current) return;
-                if (!items.length) return;
+                if (!sortedItems.length) return;
 
                 const el = listRef.current;
                 if (!el) return;
@@ -1104,7 +1186,7 @@
                 const currentFilename = getCurrentFilename(playerRef.current, src);
                 if (!currentFilename) return;
 
-                const idx = items.findIndex(it => it.name === currentFilename);
+                const idx = sortedItems.findIndex(it => it.name === currentFilename);
                 if (idx < 0) return;
 
                 const target = el.querySelectorAll('.vjs-playlist-item')[idx];
@@ -1116,13 +1198,18 @@
                 }
 
                 hasAutoScrolledRef.current = true;
-            }, [open, folderUri, items, src]);
+            }, [open, folderUri, sortedItems, src, sortSwitching]);
 
             React.useEffect(() => {
                 if (!open) {
                     hasAutoScrolledRef.current = false;
                 }
             }, [open]);
+
+            // 切换排序模式时重置自动滚动标记，让下一次布局重新定位当前项
+            React.useEffect(() => {
+                hasAutoScrolledRef.current = false;
+            }, [forceNumericSort]);
 
             React.useEffect(() => {
                 if (!open || !folderUri) return;
@@ -1372,15 +1459,16 @@
             React.useEffect(() => {
                 if (!onRegisterNav) return;
                 onRegisterNav({
-                    canNavigate: () => items.length > 0,
+                    canNavigate: () => sortedItemsRef.current.length > 0,
                     goPrev: () => {
                         const player = playerRef && playerRef.current;
                         if (!player || player.isDisposed()) return false;
-                        if (!items.length) return false;
+                        const list = sortedItemsRef.current;
+                        if (!list.length) return false;
                         const currentFilename = getCurrentFilename(player, src);
-                        const idx = items.findIndex(it => it.name === currentFilename);
+                        const idx = list.findIndex(it => it.name === currentFilename);
                         if (idx < 0) return false;
-                        const prevItem = items[(idx - 1 + items.length) % items.length];
+                        const prevItem = list[(idx - 1 + list.length) % list.length];
                         if (!prevItem) return false;
                         handleSelect(prevItem, true);
                         return true;
@@ -1388,17 +1476,18 @@
                     goNext: () => {
                         const player = playerRef && playerRef.current;
                         if (!player || player.isDisposed()) return false;
-                        if (!items.length) return false;
+                        const list = sortedItemsRef.current;
+                        if (!list.length) return false;
                         const currentFilename = getCurrentFilename(player, src);
-                        const idx = items.findIndex(it => it.name === currentFilename);
+                        const idx = list.findIndex(it => it.name === currentFilename);
                         if (idx < 0) return false;
-                        const nextItem = items[(idx + 1) % items.length];
+                        const nextItem = list[(idx + 1) % list.length];
                         if (!nextItem) return false;
                         handleSelect(nextItem, true);
                         return true;
                     },
                 });
-            }, [items, src, onRegisterNav]);
+            }, [sortedItems, src, onRegisterNav]);
 
             const clearGestureTimer = () => {
                 if (gestureRef.current.timer) {
@@ -1452,13 +1541,30 @@
             };
 
             const currentIndex = (() => {
-                if (!items.length || !currentName) return 0;
-                const idx = items.findIndex(it => it.name === currentName);
+                if (!sortedItems.length || !currentName) return 0;
+                const idx = sortedItems.findIndex(it => it.name === currentName);
                 return idx >= 0 ? idx + 1 : 0;
             })();
             const countLabel = currentIndex > 0
-                ? `${items.length}/${currentIndex}`
-                : `${items.length}`;
+                ? `${sortedItems.length}/${currentIndex}`
+                : `${sortedItems.length}`;
+
+            const handleToggleSort = () => {
+                if (sortSwitching) return;
+                setSortSwitching(true);
+                requestAnimationFrame(() => {
+                    setForceNumericSort(prev => {
+                        const next = !prev;
+                        writeSortMode(next);
+                        return next;
+                    });
+                    if (sortSwitchTimerRef.current) clearTimeout(sortSwitchTimerRef.current);
+                    sortSwitchTimerRef.current = setTimeout(() => {
+                        setSortSwitching(false);
+                        sortSwitchTimerRef.current = null;
+                    }, 260);
+                });
+            };
 
             return h('div', {
                 className: 'vjs-playlist' + (open ? ' is-open' : ''),
@@ -1466,7 +1572,20 @@
             }, [
                 h('div', { className: 'vjs-playlist-header', key: 'header' }, [
                     h('div', { className: 'vjs-playlist-header-left', key: 'left' }, [
-                        h('span', { className: 'vjs-playlist-title' }, loading ? '※\uFE0E Loading…' : '☰\uFE0E Playlist'),
+                        h('span', {
+                            className: 'vjs-playlist-title' + (sortSwitching ? ' is-switching' : ''),
+                            title: forceNumericSort ? 'Switch to default order' : 'Sort by numbers / date',
+                            style: { cursor: 'pointer', userSelect: 'none' },
+                            onClick: handleToggleSort,
+                        }, loading
+                            ? '※\uFE0E Loading…'
+                            : [
+                                h('span', {
+                                    key: 'icon',
+                                    className: 'vjs-playlist-title-icon' + (forceNumericSort ? ' is-numeric' : ''),
+                                }, forceNumericSort ? '|||' : '☰\uFE0E'),
+                                h('span', { key: 'text', className: 'vjs-playlist-title-text' }, ' Playlist'),
+                            ]),
                         h('span', { className: 'vjs-playlist-count' }, countLabel),
                     ]),
                     h('div', { className: 'vjs-playlist-header-right', key: 'right' }, [
@@ -1505,10 +1624,10 @@
                     ]),
                 ]),
                 h('div', {
-                    className: 'vjs-playlist-list',
+                    className: 'vjs-playlist-list' + (sortSwitching ? ' is-sort-switching' : ''),
                     ref: listRef,
                     key: 'list',
-                }, items.map((item) => {
+                }, sortedItems.map((item) => {
                     const isCurrent = item.name === currentName;
                     return h('div', {
                         key: item.url,

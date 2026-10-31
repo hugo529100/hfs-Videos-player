@@ -1688,3 +1688,42 @@ video::-webkit-media-text-track-display {
   opacity: 0.8;
   color: var(--good-contrast, #4a9eff);
 }
+
+/* 播放列表标题：图标 + 文字分离，避免动画影响文字 */
+.vjs-playlist-title {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0;
+  min-width: 3.4em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: none;
+}
+
+.vjs-playlist-title-icon {
+  display: inline-block;
+  min-width: 1.4em;          /* 固定占位，☰ 与 ||| 切换时不抖 */
+  text-align: left;
+}
+
+/* 数字排序模式：||| 图标渐亮渐暗呼吸 */
+.vjs-playlist-title-icon.is-numeric {
+  animation: vjs-playlist-title-breathe 1.4s ease-in-out infinite;
+}
+
+@keyframes vjs-playlist-title-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+/* 切换瞬间：暂停呼吸，避免与列表重排叠加造成视觉闪烁 */
+.vjs-playlist-title.is-switching .vjs-playlist-title-icon.is-numeric {
+  animation-play-state: paused;
+  opacity: 1;
+}
