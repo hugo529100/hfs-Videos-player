@@ -26,6 +26,13 @@ video.vjs-tech:focus-visible {
   outline: none;
 }
 
+#menu-entry-zoom,
+#menu-entry-fullscreen,
+#menu-entry-shuffle,
+#menu-entry-repeat {
+    display: none;
+}
+
 /* --- SVG Icon Base --- */
 .vjs-svg-icon {
   display: inline-block;
@@ -1726,4 +1733,13 @@ video::-webkit-media-text-track-display {
 .vjs-playlist-title.is-switching .vjs-playlist-title-icon.is-numeric {
   animation-play-state: paused;
   opacity: 1;
+}
+
+:root .theme-dark .dialog-backdrop.ibhv-backdrop,
+:root .theme-dark .dialog-backdrop.ibhi-backdrop,
+.dialog-backdrop.ibhv-backdrop,
+.dialog-backdrop.ibhi-backdrop {
+    background-color: transparent;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
 }
