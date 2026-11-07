@@ -198,6 +198,7 @@
                 row(['\u25B2\uFE0E', '\u25B3\uFE0E'], 'Lock / unlock control bar visibility'),
                 row(['\u25E2\uFE0E'], 'Hide playlist panel'),
                 row(['Item click'], 'Play that video'),
+                row(['▶\uFE0E / ₪\uFE0E'], 'Click the current item icon to toggle loop for the current video (▶\uFE0E = off, ₪\uFE0E = on)'),
                 row(['Long press', 'Double-click'], 'Open the file comment dialog'),
                 note('Playlist count shows total / current position. Bitrate is shown when available.'),
             ]),

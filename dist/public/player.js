@@ -53,6 +53,9 @@
 
         const playlistSnapshots = new Map();
 
+        // 当前播放项「临时循环」状态：按视频 URL 记录，切换视频时保留用户选择
+        const loopStateByUrl = new Map();
+
         let fileShowCloseObserver = null;
         const ensureFileShowCloseObserver = () => {
             if (fileShowCloseObserver) return;
@@ -274,10 +277,8 @@ const parseChineseNum = (str) => {
     };
     const unitMap = { '十': 10, '拾': 10, '百': 100, '佰': 100, '千': 1000, '仟': 1000 };
 
-    // 纯单位（十、百、千 单独出现 → 视为 1 个单位？一般不会，返回 null）
     if (str.length === 1 && digitMap[str] !== undefined) return digitMap[str];
 
-    // 通用解析：支持 "十一" "二十三" "一百零五" "三百二十" 等
     let total = 0;
     let section = 0;
     let currentDigit = 0;
@@ -291,13 +292,12 @@ const parseChineseNum = (str) => {
             hasAny = true;
         } else if (unitMap[ch] !== undefined) {
             const unit = unitMap[ch];
-            if (currentDigit === 0 && !lastWasUnit) currentDigit = 1; // "十一" 的 "十"
+            if (currentDigit === 0 && !lastWasUnit) currentDigit = 1;
             section += currentDigit * unit;
             currentDigit = 0;
             lastWasUnit = true;
             hasAny = true;
         } else {
-            // 混入非数字字符，放弃
             return null;
         }
     }
@@ -310,17 +310,14 @@ const pad2 = (n) => String(n).padStart(2, '0');
 
 const extractEpisode = (name) => {
     if (!name) return null;
-    const base = name.replace(/\.[^.]+$/, ''); // 去扩展名，避免把 ".mp4" 里没有数字
+    const base = name.replace(/\.[^.]+$/, '');
     const CN = '[0-9零〇一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]+';
 
-    // 1) SxxExx（英文，已自带格式；这里统一归一化补零）
     let m = base.match(/s\s*(\d+)\s*e\s*(\d+)/i);
     if (m) {
         return 'S' + pad2(parseInt(m[1], 10)) + 'E' + pad2(parseInt(m[2], 10));
     }
 
-    // 2) 第X季 第Y集（含中文数字，可有可无"第"）
-    //    覆盖：第一季第一集 / 第1季第1集 / 第一季 1集 / 1季1集
     m = base.match(
         new RegExp('第?\\s*(' + CN + ')\\s*季\\s*(?:第\\s*)?(' + CN + ')\\s*集')
     );
@@ -332,39 +329,33 @@ const extractEpisode = (name) => {
         }
     }
 
-    // 3) 只有 第X集（含中文数字）
     m = base.match(new RegExp('第?\\s*(' + CN + ')\\s*集'));
     if (m) {
         const e = parseChineseNum(m[1]);
         if (e !== null) return 'E' + pad2(e);
     }
 
-    // 4) 第X话 / 話（日漫常见），视作集
     m = base.match(new RegExp('第?\\s*(' + CN + ')\\s*[话話]'));
     if (m) {
         const e = parseChineseNum(m[1]);
         if (e !== null) return 'E' + pad2(e);
     }
 
-// 5a) 第X期（强约束：必须带"第"）
 m = base.match(new RegExp('第\\s*(' + CN + ')\\s*期'));
 if (m) {
     const p = parseChineseNum(m[1]);
     if (p !== null) return 'P-' + pad2(p);
 }
 
-// 5b) 第X部/章/节/節/篇/卷/回（中文必须带"第"）
 m = base.match(new RegExp('第\\s*(' + CN + ')\\s*(部|章|节|節|篇|卷|回)'));
 if (m) {
     const p = parseChineseNum(m[1]);
     if (p !== null) return 'P-' + pad2(p);
 }
 
-// 5c) 阿拉伯数字 + 单位（无"第"也可），不含"期"
 m = base.match(/(\d+)\s*(部|章|节|節|篇|卷|回)/);
 if (m) return 'P-' + pad2(+m[1]);
 
-    // 6) part N
     m = base.match(/part\s*(\d+)/i);
     if (m) return 'P-' + pad2(parseInt(m[1], 10));
 
@@ -373,14 +364,13 @@ if (m) return 'P-' + pad2(+m[1]);
 
 const extractNumberTokens = (name) => {
     if (!name) return [];
-    const base = name.replace(/\.[^.]+$/, ''); // 去掉扩展名
+    const base = name.replace(/\.[^.]+$/, '');
 
     const tokens = [];
-    const seenRanges = []; // 记录已消耗的字符区间，避免重复提取
+    const seenRanges = [];
 
     const overlaps = (start, end) => seenRanges.some(([s, e]) => start < e && end > s);
 
-    // 1) S01E02 形式
     {
         const re = /s(\d+)\s*e(\d+)/gi;
         let m;
@@ -392,7 +382,6 @@ const extractNumberTokens = (name) => {
         }
     }
 
-    // 2) 第 X 季 / 第 X 集 / 第 X 话 / 第 X 章 / 第 X 部 / 第 X 卷 / 第 X 回 / 第 X 期
     {
         const re = /第\s*([0-9零〇一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]+)\s*(季|集|话|話|章|部|卷|回|期|篇|节|節)/g;
         let m;
@@ -406,7 +395,6 @@ const extractNumberTokens = (name) => {
         }
     }
 
-    // 3) 季 X 集 Y（无"第"字，如 "1季3集"）
     {
         const re = /(\d+|[一二两三四五六七八九十]+)\s*季\s*(\d+|[一二两三四五六七八九十]+)\s*集/g;
         let m;
@@ -422,7 +410,6 @@ const extractNumberTokens = (name) => {
         }
     }
 
-    // 4) 裸阿拉伯数字（补漏，把所有未被上面捕获的数字 token 纳入，按出现顺序）
     {
         const re = /\d+/g;
         let m;
@@ -433,7 +420,6 @@ const extractNumberTokens = (name) => {
         }
     }
 
-    // 按出现位置排序，取 val 列表
     tokens.sort((a, b) => (a.idx - b.idx) || (a.order - b.order));
     return tokens.map(t => t.val);
 };
@@ -464,11 +450,7 @@ const extractNumberTokens = (name) => {
 
 const extractGroupKey = (name) => {
     if (!name) return '';
-    const base = name.replace(/\.[^.]+$/, ''); // 去扩展名
-
-    // 复用 token 提取逻辑得到 "起始位置"
-    // 但 extractNumberTokens 只返回数值，不返回位置。
-    // 所以这里单独计算 "第一个数字语义起点"。
+    const base = name.replace(/\.[^.]+$/, '');
 
     let firstIdx = -1;
 
@@ -477,51 +459,43 @@ const extractGroupKey = (name) => {
         if (firstIdx < 0 || idx < firstIdx) firstIdx = idx;
     };
 
-    // SxxExx
     {
         const m = base.match(/s\d+\s*e\d+/i);
         if (m) consider(m.index);
     }
 
-    // 第X集/季/... (含中文数字)
     {
         const m = base.match(/第\s*[0-9零〇一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]+\s*(季|集|话|話|章|部|卷|回|期|篇|节|節)/);
         if (m) consider(m.index);
     }
 
-    // X季Y集
     {
         const m = base.match(/[0-9一二两三四五六七八九十]+\s*季\s*[0-9一二两三四五六七八九十]+\s*集/);
         if (m) consider(m.index);
     }
 
-    // 纯阿拉伯数字
     {
         const m = base.match(/\d+/);
         if (m) consider(m.index);
     }
 
-    // part N
     {
         const m = base.match(/part\s*\d+/i);
         if (m) consider(m.index);
     }
 
-    if (firstIdx < 0) return base.trim(); // 没有数字 → 整个文件名当 groupKey
+    if (firstIdx < 0) return base.trim();
     return base.substring(0, firstIdx).trim();
 };
 
 const compareByNumbersThenDate = (a, b) => {
-    // 1) 先按前标题分组
     const ga = extractGroupKey(a.name);
     const gb = extractGroupKey(b.name);
     if (ga !== gb) {
-        // 用 localeCompare 但 numeric:false，避免 groupKey 内部数字被特殊处理
         const cmp = ga.localeCompare(gb, undefined, { numeric: false, sensitivity: 'base' });
         if (cmp !== 0) return cmp;
     }
 
-    // 2) 组内按数字序列
     const na = extractNumberTokens(a.name);
     const nb = extractNumberTokens(b.name);
     const len = Math.min(na.length, nb.length);
@@ -530,14 +504,12 @@ const compareByNumbersThenDate = (a, b) => {
     }
     if (na.length !== nb.length) return na.length - nb.length;
 
-    // 3) 日期
     const da = extractDateToken(a.name);
     const db = extractDateToken(b.name);
     if (da !== null && db !== null && da !== db) return da - db;
     if (da !== null && db === null) return -1;
     if (da === null && db !== null) return 1;
 
-    // 4) 全文
     return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
 };
 
@@ -1034,16 +1006,12 @@ const compareByNumbersThenDate = (a, b) => {
                 if (changed) {
                     playlistSnapshots.set(folderUri, lock);
                 }
-                // ★ 无条件派发，让 PlaylistPanel 重渲染
                 window.dispatchEvent(new CustomEvent('vjs-playlist-refresh', { detail: { folderUri } }));
             } catch (e) {
                 console.warn('[VideoJS] refreshSnapshotFromServer failed:', e);
             }
         };
 
-        // ============================================================
-        // ★ 通用：当前 file-show 的 folderUri
-        // ============================================================
         const getCurrentFileShowFolderUri = () => {
             const vid = document.querySelector('.file-show video.video-js, .file-show video.vjs-tech, .file-show video');
             if (vid) {
@@ -1057,9 +1025,6 @@ const compareByNumbersThenDate = (a, b) => {
             return '';
         };
 
-        // ============================================================
-        // ★ 通用对话框关闭监听：任何动作型 dialog 消失 → 刷新
-        // ============================================================
         let dialogCloseObserver = null;
         const ensureDialogCloseObserver = () => {
             if (dialogCloseObserver) return;
@@ -1092,9 +1057,6 @@ const compareByNumbersThenDate = (a, b) => {
             dialogCloseObserver.observe(document.body, { childList: true, subtree: true });
         };
 
-        // ============================================================
-        // ★ HFS.state.list 轮询兜底（800ms 一次）
-        // ============================================================
         let hfsStateWatch = null;
         const ensureHfsStateWatch = () => {
             if (hfsStateWatch) return;
@@ -1135,10 +1097,13 @@ const compareByNumbersThenDate = (a, b) => {
             const [currentName, setCurrentName] = React.useState('');
             const [loading, setLoading] = React.useState(false);
             const [bitrate, setBitrate] = React.useState(0);
+            const [loopCurrent, setLoopCurrent] = React.useState(() => {
+                const fu = getFolderUri(src);
+                const name = getCurrentFilename(playerRef && playerRef.current, src);
+                const key = fu && name ? fu + name : '';
+                return key ? !!loopStateByUrl.get(key) : false;
+            });
 
-            // ============================================================
-            // === 持久化排序模式（☰ 默认 / Ⅲ 数字强制排序） ===
-            // ============================================================
             const readSortMode = () => {
                 try {
                     return localStorage.getItem('vjs-playlist-sort') === 'num';
@@ -1169,7 +1134,6 @@ const compareByNumbersThenDate = (a, b) => {
             const itemsRef = React.useRef(items);
             itemsRef.current = items;
 
-            // 派生：按当前排序模式生成的列表（默认顺序 = items 原顺序）
             const sortedItems = React.useMemo(() => {
                 if (!forceNumericSort) return items;
                 return [...items].sort(compareByNumbersThenDate);
@@ -1309,6 +1273,10 @@ const compareByNumbersThenDate = (a, b) => {
                 const syncCurrent = () => {
                     const name = getCurrentFilename(player, src);
                     if (name) setCurrentName(name);
+                    const fu = getFolderUri(src);
+                    const key = fu && name ? fu + name : '';
+                    if (key) setLoopCurrent(!!loopStateByUrl.get(key));
+                    else setLoopCurrent(false);
                 };
 
                 player.on('loadstart', syncCurrent);
@@ -1392,7 +1360,6 @@ const compareByNumbersThenDate = (a, b) => {
                 }
             }, [open]);
 
-            // 切换排序模式时重置自动滚动标记，让下一次布局重新定位当前项
             React.useEffect(() => {
                 hasAutoScrolledRef.current = false;
             }, [forceNumericSort]);
@@ -1534,6 +1501,35 @@ const compareByNumbersThenDate = (a, b) => {
 
             const switchingRef = React.useRef(false);
 
+            const applyLoopToPlayer = (player, item, forcePlay = false) => {
+                if (!player || player.isDisposed()) return;
+                const fu = getFolderUri(src);
+                const name = item && item.name ? item.name : getCurrentFilename(player, src);
+                const key = fu && name ? fu + name : '';
+                const loopOn = key ? !!loopStateByUrl.get(key) : false;
+                try { player.loop(loopOn); } catch (e) {}
+                setLoopCurrent(loopOn);
+            };
+
+            const toggleLoopCurrent = (e) => {
+                if (e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                }
+                const player = playerRef && playerRef.current;
+                const fu = getFolderUri(src);
+                const name = getCurrentFilename(player, src);
+                const key = fu && name ? fu + name : '';
+                if (!key) return;
+                const next = !loopStateByUrl.get(key);
+                if (next) loopStateByUrl.set(key, true);
+                else loopStateByUrl.delete(key);
+                if (player && !player.isDisposed()) {
+                    try { player.loop(next); } catch (err) {}
+                }
+                setLoopCurrent(next);
+            };
+
             const handleSelect = (item, forcePlay = false) => {
                 const player = playerRef && playerRef.current;
                 if (!player || player.isDisposed()) return;
@@ -1562,8 +1558,14 @@ const compareByNumbersThenDate = (a, b) => {
                 transferRef.dialogEl = null;
                 interruptCurrentTransfer('playlist-select');
 
+                const fu = getFolderUri(src);
+                const key = fu && item.name ? fu + item.name : '';
+                const loopOn = key ? !!loopStateByUrl.get(key) : false;
+
                 if (isWrapperFullscreen()) {
                     player.src({ src: item.url, type: determineMimeType(item.url) });
+                    try { player.loop(loopOn); } catch (e) {}
+                    setLoopCurrent(loopOn);
                     if (wasPlaying) {
                         const p = player.play();
                         if (p && p.catch) p.catch(() => {});
@@ -1579,6 +1581,8 @@ const compareByNumbersThenDate = (a, b) => {
                 const entry = findHfsEntryByName(item.name);
                 if (!entry || typeof HFS.fileShow !== 'function') {
                     player.src({ src: item.url, type: determineMimeType(item.url) });
+                    try { player.loop(loopOn); } catch (e) {}
+                    setLoopCurrent(loopOn);
                     if (wasPlaying) {
                         const p = player.play();
                         if (p && p.catch) p.catch(() => {});
@@ -1599,6 +1603,8 @@ const compareByNumbersThenDate = (a, b) => {
                 } catch (e) {
                     console.warn('[VideoJS] HFS.fileShow threw:', e);
                     player.src({ src: item.url, type: determineMimeType(item.url) });
+                    try { player.loop(loopOn); } catch (err) {}
+                    setLoopCurrent(loopOn);
                     if (wasPlaying) {
                         const p = player.play();
                         if (p && p.catch) p.catch(() => {});
@@ -1622,15 +1628,18 @@ const compareByNumbersThenDate = (a, b) => {
                             if (d !== newest && d.parentNode) closeWithFade(d, 180, 220);
                         });
 
-                        if (wasPlaying && newest) {
+                        if (newest) {
                             const newVideoEl = newest.querySelector('video.video-js, video.vjs-tech, .video-js video');
                             if (newVideoEl) {
                                 const newPlayer = videojs.getPlayer(newVideoEl);
                                 if (newPlayer && !newPlayer.isDisposed()) {
                                     transferRef.player = newPlayer;
                                     transferRef.videoEl = newVideoEl;
-                                    const playPromise = newPlayer.play();
-                                    if (playPromise && playPromise.catch) playPromise.catch(() => {});
+                                    try { newPlayer.loop(loopOn); } catch (e) {}
+                                    if (wasPlaying) {
+                                        const playPromise = newPlayer.play();
+                                        if (playPromise && playPromise.catch) playPromise.catch(() => {});
+                                    }
                                 }
                             }
                         }
@@ -1833,7 +1842,15 @@ const compareByNumbersThenDate = (a, b) => {
                         onTouchEnd: () => onItemPointerUp(),
                         onTouchCancel: () => clearGestureTimer(),
                     }, [
-                        h('span', { className: 'vjs-playlist-item-icon' }, '▶\uFE0E'),
+                        h('span', {
+                            className: 'vjs-playlist-item-icon' + (isCurrent && loopCurrent ? ' is-loop' : ''),
+                            title: isCurrent
+                                ? (loopCurrent ? 'Loop current video (click to disable)' : 'Loop current video (click to enable)')
+                                : '▶\uFE0E',
+                            onClick: (e) => {
+                                if (isCurrent) toggleLoopCurrent(e);
+                            },
+                        }, isCurrent && loopCurrent ? '₪\uFE0E' : '▶\uFE0E'),
                         h('span', { className: 'vjs-playlist-item-name' }, [
                             h('span', { className: 'vjs-playlist-item-name-text', key: 'name' }, item.name),
                             (item.episode || item.comment) && h('span', { className: 'vjs-playlist-item-meta', key: 'meta' }, [
@@ -2505,6 +2522,12 @@ const compareByNumbersThenDate = (a, b) => {
                         errorShownRef.current = false;
                         player.src({ src: targetSrc, type: conversionMode ? 'video/mp4' : determineMimeType(props.src) });
                         if (!conversionMode || C.enable_transcoding_seeking) attemptResume(props.src);
+
+                        const fu = getFolderUri(props.src);
+                        const name = getCurrentFilename(player, props.src);
+                        const key = fu && name ? fu + name : '';
+                        const loopOn = key ? !!loopStateByUrl.get(key) : false;
+                        try { player.loop(loopOn); } catch (e) {}
 
                         if (C.autoplay || conversionMode) {
                             const p = player.play();

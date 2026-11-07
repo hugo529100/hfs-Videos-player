@@ -1743,3 +1743,15 @@ video::-webkit-media-text-track-display {
     backdrop-filter: none;
     -webkit-backdrop-filter: none;
 }
+
+/* 播放列表当前项：循环开启时图标高亮 */
+.vjs-playlist-item.is-current .vjs-playlist-item-icon.is-loop {
+  opacity: 1;
+  color: var(--good-contrast);
+  cursor: pointer;
+}
+
+/* 播放列表当前项图标可点击提示 */
+.vjs-playlist-item.is-current .vjs-playlist-item-icon {
+  cursor: pointer;
+}
