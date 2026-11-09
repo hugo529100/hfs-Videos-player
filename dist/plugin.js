@@ -48,7 +48,7 @@ exports.config = {
     },
     inactivityTimeout: {
         showIf: x => x.config_tab === 'general',
-        type: 'number', defaultValue: 2000, min: 0,
+        type: 'number', defaultValue: 1000, min: 0,
         label: "Auto-Hide Controls (ms)",
         helperText: "How long controls stay visible after mouse movement. Set 0 to keep always visible.",
         frontend: true
