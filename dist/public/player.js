@@ -56,14 +56,216 @@
         // 当前播放项「临时循环」状态：按视频 URL 记录，切换视频时保留用户选择
         const loopStateByUrl = new Map();
 
+        // ============================================================
+        // === Playback Memory Guard ===
+        // 播放器打开期间：最大化释放不可见元素 RAM
+        //  1) 全局禁用 backdrop-filter / box-shadow（减少合成层）
+        //  2) 挂起所有 .dir 封面图（卸 src，释放图片解码内存）
+        //  3) 切视频期间保持挂起，禁止任何重载
+        // 彻底关闭后：移除全局类恢复 blur/shadow + 重建 IO 恢复缩略图
+        // ============================================================
+        const PLAYBACK_CSS_ID = 'vjs-playback-active-style';
+        const PLAYBACK_ROOT_CLASS = 'vjs-playback-active';
+        const DIR_SELECTOR = '.dir';
+        const THUMB_SELECTOR = 'img.thumbnail';
+
+        const playbackMemoryGuard = (() => {
+            let active = false;
+            let scrollIO = null;
+            let scrollMO = null;
+
+            function injectStyle() {
+                if (document.getElementById(PLAYBACK_CSS_ID)) return;
+                const st = document.createElement('style');
+                st.id = PLAYBACK_CSS_ID;
+                st.textContent = `
+html.${PLAYBACK_ROOT_CLASS},
+html.${PLAYBACK_ROOT_CLASS} * {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+    box-shadow: none !important;
+}
+`;
+                document.head.appendChild(st);
+            }
+
+            function getRootMargin() {
+                try {
+                    const cfg = HFS.getPluginConfig ? HFS.getPluginConfig() : null;
+                    if (cfg && cfg.scrollRootMargin != null) {
+                        const n = Number(cfg.scrollRootMargin);
+                        if (!isNaN(n) && n >= 0) return `${n}px 0px`;
+                    }
+                } catch (e) {}
+                return '100px 0px';
+            }
+
+            function isDirThumb(img) {
+                if (!img || img.tagName !== 'IMG') return false;
+                if (!img.matches(THUMB_SELECTOR)) return false;
+                if (!img.closest(DIR_SELECTOR)) return false;
+                const src = img.getAttribute('src') || img.dataset.scrollOriginalSrc || '';
+                if (!src || src.startsWith('data:')) return false;
+                return true;
+            }
+
+            function suspend(img) {
+                if (!isDirThumb(img)) return;
+                const src = img.getAttribute('src');
+                if (src && !src.startsWith('data:')) {
+                    if (!img.dataset.scrollOriginalSrc) img.dataset.scrollOriginalSrc = src;
+                    img.removeAttribute('src');
+                }
+                try { img.onload = null; img.onerror = null; } catch (e) {}
+                img.dataset.scrollSuspended = '1';
+                img.classList.add('scroll-suspended');
+            }
+
+            function resume(img) {
+                if (active) return; // 播放期间禁止恢复
+                if (!img.dataset.scrollSuspended) return;
+                delete img.dataset.scrollSuspended;
+                img.classList.remove('scroll-suspended');
+                const original = img.dataset.scrollOriginalSrc;
+                if (original && !img.classList.contains('thumbnail-suspended')) {
+                    delete img.dataset.fadeProcessed;
+                    img.style.opacity = '';
+                    img.setAttribute('src', original);
+                }
+            }
+
+            function buildIO() {
+                if (scrollIO) scrollIO.disconnect();
+                scrollIO = new IntersectionObserver((entries) => {
+                    for (const e of entries) {
+                        const img = e.target;
+                        if (!isDirThumb(img)) continue;
+                        if (active) { suspend(img); continue; }
+                        if (e.isIntersecting) resume(img);
+                        else suspend(img);
+                    }
+                }, { root: null, rootMargin: getRootMargin(), threshold: 0 });
+            }
+
+            function observeAll() {
+                if (!scrollIO) return;
+                document.querySelectorAll(`${DIR_SELECTOR} ${THUMB_SELECTOR}`).forEach(img => {
+                    if (isDirThumb(img)) {
+                        if (active) suspend(img);
+                        scrollIO.observe(img);
+                    }
+                });
+            }
+
+            function startMO() {
+                if (scrollMO) return;
+                scrollMO = new MutationObserver((muts) => {
+                    for (const m of muts) {
+                        for (const node of m.addedNodes) {
+                            if (node.nodeType !== 1) continue;
+                            if (node.matches && node.matches(THUMB_SELECTOR) && node.closest(DIR_SELECTOR)) {
+                                if (isDirThumb(node) && scrollIO) {
+                                    if (active) suspend(node);
+                                    scrollIO.observe(node);
+                                }
+                            }
+                            if (node.querySelectorAll && scrollIO) {
+                                node.querySelectorAll(THUMB_SELECTOR).forEach(img => {
+                                    if (img.closest(DIR_SELECTOR) && isDirThumb(img)) {
+                                        if (active) suspend(img);
+                                        scrollIO.observe(img);
+                                    }
+                                });
+                            }
+                        }
+                    }
+                });
+                scrollMO.observe(document.body, { childList: true, subtree: true });
+            }
+
+            function suspendAllThumbs() {
+                document.querySelectorAll(`${DIR_SELECTOR} ${THUMB_SELECTOR}`).forEach(img => {
+                    if (isDirThumb(img)) suspend(img);
+                });
+            }
+
+            function enter() {
+                if (active) return;
+                active = true;
+                injectStyle();
+                document.documentElement.classList.add(PLAYBACK_ROOT_CLASS);
+                if (scrollIO) { scrollIO.disconnect(); scrollIO = null; }
+                suspendAllThumbs();
+            }
+
+            function exit() {
+                if (!active) return;
+                active = false;
+                // 移除全局类 → backdrop-filter / box-shadow 规则立即失效，
+                // 各元素恢复自身 CSS 声明的 blur/shadow（即 HFS 主题原有效果）
+                document.documentElement.classList.remove(PLAYBACK_ROOT_CLASS);
+
+                // 缩略图恢复：重建 IO，让视口内缩略图重新加载
+                setTimeout(() => {
+                    if (active) return;
+                    buildIO();
+                    observeAll();
+                }, 300);
+            }
+
+            function boot() {
+                injectStyle();
+                buildIO();
+                startMO();
+                setTimeout(observeAll, 500);
+                try {
+                    if (HFS.watchState) {
+                        HFS.watchState('uri', () => {
+                            if (active) return;
+                            buildIO();
+                            setTimeout(observeAll, 200);
+                        }, true);
+                    }
+                } catch (e) {}
+            }
+
+            return {
+                boot,
+                enter,
+                exit,
+                isActive: () => active,
+            };
+        })();
+
+        playbackMemoryGuard.boot();
+
         let fileShowCloseObserver = null;
+
         const ensureFileShowCloseObserver = () => {
             if (fileShowCloseObserver) return;
+
+            let hadFileShow = document.querySelectorAll('.file-show').length > 0;
+            if (hadFileShow) {
+                playbackMemoryGuard.enter();
+            }
+
             fileShowCloseObserver = new MutationObserver(() => {
-                if (document.querySelectorAll('.file-show').length === 0 && playlistSnapshots.size > 0) {
-                    playlistSnapshots.clear();
+                const has = document.querySelectorAll('.file-show').length > 0;
+
+                if (hadFileShow !== has) {
+                    if (has) {
+                        playbackMemoryGuard.enter();
+                    } else {
+                        // 彻底关闭（切视频时 has 始终 true，不触发）
+                        playbackMemoryGuard.exit();
+                        if (playlistSnapshots.size > 0) {
+                            playlistSnapshots.clear();
+                        }
+                    }
                 }
+                hadFileShow = has;
             });
+
             fileShowCloseObserver.observe(document.body, { childList: true, subtree: true });
         };
 

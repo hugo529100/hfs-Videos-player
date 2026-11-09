@@ -651,7 +651,6 @@ body.vjs-full-window {
   -moz-user-select: none;
   user-select: none;
   background-color: var(--ghost-contrast) !important;
-  backdrop-filter: none;
 }
 
 .video-js .vjs-slider.disabled {
@@ -1394,7 +1393,6 @@ video::-webkit-media-text-track-display {
   -webkit-tap-highlight-color: transparent;
   flex: 0 0 auto;
   background: rgba(0, 0, 0, 0.603);
-  backdrop-filter: none;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -1739,9 +1737,7 @@ video::-webkit-media-text-track-display {
 :root .theme-dark .dialog-backdrop.ibhi-backdrop,
 .dialog-backdrop.ibhv-backdrop,
 .dialog-backdrop.ibhi-backdrop {
-    background-color: transparent;
-    backdrop-filter: none;
-    -webkit-backdrop-filter: none;
+    background-color: transparent !important;
 }
 
 /* 播放列表当前项：循环开启时图标高亮 */
