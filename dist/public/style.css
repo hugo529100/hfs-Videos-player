@@ -1751,3 +1751,11 @@ video::-webkit-media-text-track-display {
 .vjs-playlist-item.is-current .vjs-playlist-item-icon {
   cursor: pointer;
 }
+
+/* ============================================
+   控制欄 playToggle：僅暫停時緩慢呼吸閃爍提示
+   ============================================ */
+/* 控制欄 playToggle：僅暫停時複用現有呼吸動畫 */
+.video-js.vjs-paused .vjs-play-control .vjs-icon-placeholder {
+  animation: vjs-playlist-title-breathe 1.4s ease-in-out infinite;
+}

@@ -53,16 +53,26 @@
 
         const playlistSnapshots = new Map();
 
-        // 当前播放项「临时循环」状态：按视频 URL 记录，切换视频时保留用户选择
         const loopStateByUrl = new Map();
+
+        // HLS library loader (hls.light.min.js preloaded by plugin.js).
+        let hlsLoadingPromise = null;
+        const loadHlsLib = () => {
+            if (window.Hls) return Promise.resolve(window.Hls);
+            if (hlsLoadingPromise) return hlsLoadingPromise;
+            const url = (HFS.getPluginPublic ? HFS.getPluginPublic() : '') + 'hls.light.min.js';
+            hlsLoadingPromise = HFS.loadScript(url).then(() => {
+                if (!window.Hls) throw new Error('HLS library failed to load');
+                return window.Hls;
+            }).catch(err => {
+                hlsLoadingPromise = null;
+                throw err;
+            });
+            return hlsLoadingPromise;
+        };
 
         // ============================================================
         // === Playback Memory Guard ===
-        // 播放器打开期间：最大化释放不可见元素 RAM
-        //  1) 全局禁用 backdrop-filter / box-shadow（减少合成层）
-        //  2) 挂起所有 .dir 封面图（卸 src，释放图片解码内存）
-        //  3) 切视频期间保持挂起，禁止任何重载
-        // 彻底关闭后：移除全局类恢复 blur/shadow + 重建 IO 恢复缩略图
         // ============================================================
         const PLAYBACK_CSS_ID = 'vjs-playback-active-style';
         const PLAYBACK_ROOT_CLASS = 'vjs-playback-active';
@@ -122,7 +132,7 @@ html.${PLAYBACK_ROOT_CLASS} * {
             }
 
             function resume(img) {
-                if (active) return; // 播放期间禁止恢复
+                if (active) return;
                 if (!img.dataset.scrollSuspended) return;
                 delete img.dataset.scrollSuspended;
                 img.classList.remove('scroll-suspended');
@@ -201,11 +211,7 @@ html.${PLAYBACK_ROOT_CLASS} * {
             function exit() {
                 if (!active) return;
                 active = false;
-                // 移除全局类 → backdrop-filter / box-shadow 规则立即失效，
-                // 各元素恢复自身 CSS 声明的 blur/shadow（即 HFS 主题原有效果）
                 document.documentElement.classList.remove(PLAYBACK_ROOT_CLASS);
-
-                // 缩略图恢复：重建 IO，让视口内缩略图重新加载
                 setTimeout(() => {
                     if (active) return;
                     buildIO();
@@ -256,7 +262,6 @@ html.${PLAYBACK_ROOT_CLASS} * {
                     if (has) {
                         playbackMemoryGuard.enter();
                     } else {
-                        // 彻底关闭（切视频时 has 始终 true，不触发）
                         playbackMemoryGuard.exit();
                         if (playlistSnapshots.size > 0) {
                             playlistSnapshots.clear();
@@ -913,7 +918,7 @@ const compareByNumbersThenDate = (a, b) => {
                 setTimeout(() => {
                     if (!dialogEl.parentNode) return;
                     const closeBtn = dialogEl.querySelector('.bar button[title="Close"]')
-                        || dialogEl.querySelector('.bar button.icon-button:last-child');
+                        || dialogEl.querySelector('.bar button.icon-only:last-child');
                     if (closeBtn) closeBtn.click();
                     else if (dialogEl.parentNode) dialogEl.parentNode.removeChild(dialogEl);
                 }, fade);
@@ -2264,6 +2269,8 @@ const compareByNumbersThenDate = (a, b) => {
             const hevcTimeoutRef = React.useRef(null);
             const toggleBtnRef = React.useRef(null);
             const playlistNavRef = React.useRef(null);
+            const hlsRef = React.useRef(null);
+            const hlsModeRef = React.useRef(null);
 
             const [conversionMode, setConversionMode] = React.useState(false);
             const isConvertingRef = React.useRef(false);
@@ -2315,7 +2322,81 @@ const compareByNumbersThenDate = (a, b) => {
                 }
             };
 
+            const destroyHls = () => {
+                if (hlsRef.current) {
+                    try { hlsRef.current.destroy(); } catch (e) {}
+                    hlsRef.current = null;
+                }
+                hlsModeRef.current = null;
+            };
+
+            // Fallback: play via ?ffmpeg=hls + hls.js (mirrors unsupported-videos main.js).
+            const playViaHls = async (player, originalSrc) => {
+                if (!player || player.isDisposed() || !originalSrc) return;
+                destroyHls();
+
+                const url = new URL(originalSrc, location.href);
+                url.searchParams.set('ffmpeg', 'hls');
+
+                const videoEl = player.el()
+                    ? player.el().querySelector('video.video-js, video.vjs-tech, .video-js video')
+                    : null;
+                if (!videoEl) {
+                    notify(player, 'Cannot find video element', 'error', 0);
+                    return;
+                }
+
+                const nativeHls = !!(videoEl.canPlayType && videoEl.canPlayType('application/vnd.apple.mpegurl'));
+
+                const start = async () => {
+                    try {
+                        if (nativeHls && navigator.vendor === 'Apple Computer, Inc.') {
+                            hlsModeRef.current = 'native';
+                            player.src({ src: url.href, type: 'application/x-mpegURL' });
+                            const p = player.play();
+                            if (p && p.catch) p.catch(() => {});
+                            return;
+                        }
+                        await loadHlsLib();
+                        if (!player || player.isDisposed()) return;
+                        if (!window.Hls.isSupported()) {
+                            if (!nativeHls) throw new Error('HLS is not supported by this browser');
+                            hlsModeRef.current = 'native';
+                            player.src({ src: url.href, type: 'application/x-mpegURL' });
+                            const p = player.play();
+                            if (p && p.catch) p.catch(() => {});
+                            return;
+                        }
+                        hlsModeRef.current = 'hls.js';
+                        const hls = new window.Hls({ maxBufferLength: 12, maxMaxBufferLength: 24 });
+                        hls.on(window.Hls.Events.ERROR, (_, data) => {
+                            if (data.fatal) {
+                                try { hls.destroy(); } catch (e) {}
+                                hlsRef.current = null;
+                                if (!errorShownRef.current) {
+                                    notify(player, 'Video conversion failed', 'error', 0);
+                                    errorShownRef.current = true;
+                                }
+                            }
+                        });
+                        hls.loadSource(url.href);
+                        hls.attachMedia(videoEl);
+                        hlsRef.current = hls;
+                        const p = player.play();
+                        if (p && p.catch) p.catch(() => {});
+                    } catch (err) {
+                        console.warn('[VideoJS] HLS setup failed:', err);
+                        if (!errorShownRef.current) {
+                            notify(player, 'Video conversion failed', 'error', 0);
+                            errorShownRef.current = true;
+                        }
+                    }
+                };
+                start();
+            };
+
             const handlePlaybackError = (player, message = "Video format not supported.") => {
+                // Try fMP4 transcoding first (existing behaviour).
                 if (C.enable_ffmpeg_transcoding && !isConvertingRef.current) {
                     console.log("[VideoJS] Unsupported video detected. Switching to streaming conversion...");
                     notify(player, "Unsupported format. Attempting conversion...", "info", 3000);
@@ -2328,6 +2409,14 @@ const compareByNumbersThenDate = (a, b) => {
                         ? player.el().querySelector('video.video-js, video.vjs-tech, .video-js video')
                         : null;
                     setConversionMode(true);
+                    return;
+                }
+
+                // If fMP4 already failed, try HLS fallback.
+                if (C.enable_ffmpeg_transcoding && isConvertingRef.current && props.src && hlsModeRef.current === null) {
+                    console.log("[VideoJS] fMP4 failed. Falling back to HLS...");
+                    notify(player, "Conversion failed. Trying HLS...", "info", 3000);
+                    playViaHls(player, props.src);
                     return;
                 }
 
@@ -2470,6 +2559,41 @@ const compareByNumbersThenDate = (a, b) => {
 
                 player.ready(() => {
                     enforceVolumeState();
+                    // === 修正 PlayToggle 圖標語義：顯示當前狀態而非下一步動作 ===
+                    try {
+                        const controlBar = player.getChild('controlBar');
+                        const playToggle = controlBar && controlBar.getChild('playToggle');
+                        if (playToggle && !playToggle.__iconPatched) {
+                            playToggle.__iconPatched = true;
+
+                            playToggle.handlePlay = function (e) {
+                                this.removeClass('vjs-ended', 'vjs-paused');
+                                this.addClass('vjs-playing');
+                                this.setIcon('play');
+                                this.controlText('Pause');
+                            };
+
+                            playToggle.handlePause = function (e) {
+                                this.removeClass('vjs-playing');
+                                this.addClass('vjs-paused');
+                                this.setIcon('pause');
+                                this.controlText('Play');
+                            };
+
+                            playToggle.handleEnded = function (e) {
+                                this.removeClass('vjs-playing');
+                                this.addClass('vjs-ended');
+                                this.setIcon('replay');
+                                this.controlText('Replay');
+                                this.one(this.player_, 'seeked', (ev) => this.handleSeeked(ev));
+                            };
+
+                            if (player.paused()) playToggle.handlePause();
+                            else playToggle.handlePlay();
+                        }
+                    } catch (e) {
+                        console.warn('[VideoJS] PlayToggle icon patch failed:', e);
+                    }
                     player.on('volumechange', enforceVolumeState);
 
                     const insertToggleButton = () => {
@@ -2602,6 +2726,15 @@ const compareByNumbersThenDate = (a, b) => {
                     }
                 };
                 player.on('loadedmetadata', checkHevc);
+                player.on('loadeddata', checkHevc);
+                player.on('canplay', checkHevc);
+                player.on('playing', () => {
+                    setTimeout(() => {
+                        if (player && !player.isDisposed() && player.videoWidth() === 0 && !isConvertingRef.current) {
+                            handlePlaybackError(player, "No video output detected.");
+                        }
+                    }, 5000);
+                });
 
                 const saveProgress = () => {
                     if (!C.resumePlayback || !player || player.isDisposed()) return;
@@ -2658,15 +2791,18 @@ const compareByNumbersThenDate = (a, b) => {
 
                 player.on('error', () => {
                     const code = player.error() ? player.error().code : 0;
-                    if (code === 4) {
+                    if (code === 4 || code === 3) {
                         player.error(null);
-                        handlePlaybackError(player, "The media could not be loaded, either because the server or network failed or because the format is not supported.");
+                        handlePlaybackError(player, code === 3
+                            ? "Decode error. Attempting conversion..."
+                            : "The media could not be loaded, either because the server or network failed or because the format is not supported.");
                         return;
                     }
                     if (props.onError) props.onError(player.error());
                 });
 
                 return () => {
+                    destroyHls();
                     hardBrakeVideo(videoElementRef.current);
 
                     if (debouncedSaveProgress.cancel) debouncedSaveProgress.cancel();
@@ -2708,6 +2844,7 @@ const compareByNumbersThenDate = (a, b) => {
                         transferRef.transcoding = false;
                         setSeekOffset(0);
                         hasResumedRef.current = false;
+                        destroyHls();
                     }
                 }
 

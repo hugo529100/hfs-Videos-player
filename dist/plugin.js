@@ -1,5 +1,5 @@
 exports.description = "A simplified & lightweight Video.js player plugin, modified from VenB304/videojs-player.";
-exports.version = 2.9;
+exports.version = 3.4;
 exports.apiRequired = 10.0;
 exports.repo = "Hug3O/Videos-player+";
 exports.frontend_css = [
@@ -8,6 +8,7 @@ exports.frontend_css = [
 
 exports.frontend_js = [
     'video.min.js',
+    'hls.light.min.js',
     'player.js',
     'fileshow-help-video.js'
 ];
@@ -241,15 +242,41 @@ exports.config = {
         helperText: "Only these users can trigger transcoding. Leave empty to allow all logged-in users.",
         frontend: true
     },
+        debug_mode: {
+        showIf: x => x.config_tab === 'advanced',
+        type: 'boolean',
+        defaultValue: false,
+        label: "Debug Mode",
+        helperText: "Enable verbose server-side logging for transcoding and HLS. Disable in production.",
+        frontend: true
+    },
 };
 
 exports.init = api => {
-    const running = new Map() // key=process, value=username
-    const { spawn } = api.require('child_process')
+    const running = new Map(); // key=process, value=username
+    const { spawn } = api.require('child_process');
+
+    // HLS server module (copied from unsupported-videos). Required for ?ffmpeg=hls.
+    let serveHls = null;
+    try {
+        serveHls = require('./hls');
+    } catch (e) {
+        serveHls = null;
+    }
+
+    const isDebug = () => {
+        try { return !!api.getConfig('debug_mode'); } catch (e) { return false; }
+    };
+    const dbg = (...args) => { if (isDebug()) console.log('[VideoJS]', ...args); };
+    const dbgErr = (...args) => { if (isDebug()) console.error('[VideoJS]', ...args); };
+    const dbgWarn = (...args) => { if (isDebug()) console.warn('[VideoJS]', ...args); };
 
     function terminate(proc) {
-        proc.kill()
-        setTimeout(() => proc.kill('SIGKILL'), 10_000)
+        if (!proc || proc.killed || proc.exitCode !== null) return;
+        try { proc.kill(); } catch (e) {}
+        const force = setTimeout(() => { try { proc.kill('SIGKILL'); } catch (e) {} }, 10_000);
+        if (force.unref) force.unref();
+        proc.once('exit', () => clearTimeout(force));
     }
 
     const onExit = () => {
@@ -266,7 +293,7 @@ exports.init = api => {
             process.off('SIGINT', onExit);
             process.off('SIGTERM', onExit);
             for (const proc of running.keys())
-                terminate(proc)
+                terminate(proc);
         },
         middleware: async ctx => {
             return async () => { // wait for fileSource to be available
@@ -281,7 +308,7 @@ exports.init = api => {
                 if (!qsObj.has('ffmpeg')) return;
 
                 const username = api.getCurrentUsername(ctx);
-                
+
                 // --- Access Control ---
                 const allowAnonymous = api.getConfig('transcoding_allow_anonymous');
                 if (!allowAnonymous) {
@@ -314,17 +341,17 @@ exports.init = api => {
                         running.delete(oldest);
                     }
                 }
-                
+
                 // Per-User Debounce for fast seeks
                 await new Promise(res => setTimeout(res, 200));
-                if (ctx.socket.closed) return;
+                if (ctx.socket && ctx.socket.closed) return;
 
                 const ffmpegPath = api.getConfig('ffmpeg_path') || 'ffmpeg';
                 const extraParamsStr = api.getConfig('ffmpeg_parameters') || '';
                 const hardware = api.getConfig('ffmpeg_hardware_accel') || 'cpu';
 
                 if (/[;&|]/.test(ffmpegPath)) {
-                    console.error(`[VideoJS] Security Error: Invalid characters detected in ffmpeg_path: ${ffmpegPath}`);
+                    dbgErr('Security Error: Invalid characters detected in ffmpeg_path:', ffmpegPath);
                     return ctx.status = 500;
                 }
 
@@ -356,10 +383,85 @@ exports.init = api => {
                 const startTimeInput = qsObj.get('startTime');
                 const startTime = startTimeInput ? parseFloat(startTimeInput) : 0;
 
-                const mkArgs = (src, start, extra) => {
+                // Shared process starter used by both fMP4 and HLS branches.
+                const startProcess = (args, stdio = ['ignore', 'pipe', 'ignore']) => {
+                    const proc = spawn(ffmpegPath, args, { stdio });
+                    running.set(proc, username);
+                    dbg('spawn ffmpeg:', ffmpegPath, args.join(' '));
+
+                    const disconnect = () => terminate(proc);
+
+                    // Guard: ctx.res / ctx.req may be null in some request lifecycles.
+                    const attachClose = (obj) => {
+                        if (obj && typeof obj.once === 'function') {
+                            obj.once('close', disconnect);
+                            return obj;
+                        }
+                        return null;
+                    };
+                    const closeHost = attachClose(ctx.res) || attachClose(ctx.req);
+
+                    const release = () => {
+                        running.delete(proc);
+                        if (closeHost && typeof closeHost.removeListener === 'function') {
+                            closeHost.removeListener('close', disconnect);
+                        }
+                        dbg('ffmpeg released, running.size =', running.size);
+                    };
+                    proc.once('error', (err) => {
+                        dbgErr('ffmpeg spawn error:', err && err.message ? err.message : err);
+                        release();
+                    });
+                    proc.once('exit', (code) => {
+                        if (code !== 0 && code !== null) {
+                            dbgErr('ffmpeg exited with code:', code);
+                        } else {
+                            dbg('ffmpeg exited normally, code:', code);
+                        }
+                        release();
+                    });
+
+                    if (proc.stderr && typeof proc.stderr.on === 'function') {
+                        proc.stderr.on('data', x => dbg('ffmpeg stderr:', String(x)));
+                    }
+
+                    return proc;
+                };
+
+                // ============================================================
+                // === HLS branch (?ffmpeg=hls / ?ffmpeg=segment) ===
+                // ============================================================
+                if (qsObj.get('ffmpeg')) {
+                    if (!serveHls) {
+                        ctx.status = 501;
+                        ctx.body = "HLS server module ('./hls') not found in plugin directory.";
+                        return;
+                    }
+                    ctx.status = 200;
+                    try {
+                        await serveHls(ctx, qsObj, startProcess, extraParams);
+                    } catch (error) {
+                        dbgErr('HLS error:', error && error.message ? error.message : error);
+                        if (!ctx.headerSent) {
+                            ctx.status = 502;
+                            ctx.body = "Video conversion failed";
+                        }
+                    }
+                    return;
+                }
+
+                // ============================================================
+                // === fMP4 branch (?ffmpeg only) ===
+                // ============================================================
+                const mkArgs = (source, start, extra) => {
                     const args = [];
                     if (start > 0) args.push('-ss', String(start));
-                    args.push('-i', src);
+                    args.push('-i', source);
+
+                    // Explicit stream mapping: avoid data/subtitle/cover tracks clogging the muxer.
+                    args.push('-map', '0:v:0', '-map', '0:a:0?', '-dn', '-sn');
+                    // Raise muxing queue for high-bitrate sources.
+                    args.push('-max_muxing_queue_size', '4096');
 
                     if (hardware === 'custom') {
                         args.push('-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov+delay_moov', '-strict', '-2');
@@ -404,47 +506,28 @@ exports.init = api => {
                             case 'cpu':
                             default: {
                                 const p = getPreset('preset_cpu');
-                                args.push('-c:v', 'libx264', '-preset', p, '-pix_fmt', 'yuv420p');
+                                args.push('-c:v', 'libx264', '-preset', p, '-pix_fmt', 'yuv420p', '-crf', '23', '-maxrate', '8M', '-bufsize', '16M');
                                 break;
                             }
                         }
                     }
                     args.push('pipe:1');
                     return args;
+                };
+
+                const proc = startProcess(mkArgs(src, startTime, extraParams));
+
+                if (!proc.stdout) {
+                    dbgErr('FFmpeg stdout is null; cannot stream. Spawn likely failed.');
+                    ctx.status = 500;
+                    ctx.body = 'FFmpeg failed to start';
+                    return;
                 }
-
-                let spawnCmd = ffmpegPath;
-                let spawnArgs = mkArgs(src, startTime, extraParams);
-                let spawnOptions = {};
-
-                if (process.platform !== 'win32') {
-                    spawnCmd = 'nice';
-                    spawnArgs = ['-n', '10', ffmpegPath, ...spawnArgs];
-                }
-
-                const proc = spawn(spawnCmd, spawnArgs, spawnOptions);
-                running.set(proc, username);
-
-                proc.on('error', (err) => {
-                    console.error("VideoJS FFmpeg Error:", err);
-                    if (err.code === 'ENOENT') console.error("VideoJS Critical Error: FFmpeg binary not found. Check 'ffmpeg_path' in plugin settings.");
-                    running.delete(proc);
-                });
-                proc.on('exit', (code) => {
-                    if (code !== 0 && code !== null) {
-                        console.log("VideoJS FFmpeg Process Exited with Error Code:", code);
-                        if (code === 1) console.log("VideoJS Hint: Possible invalid arguments or unsupported codec/preset.");
-                    }
-                    running.delete(proc);
-                });
-
-                proc.stderr.on('data', x => console.log('VideoJS FFmpeg:', String(x)));
 
                 ctx.type = 'video/mp4';
                 ctx.body = proc.stdout;
-                ctx.req.on('end', () => terminate(proc));
                 return ctx.status = 200;
             }
         }
-    }
-}
+    };
+};
