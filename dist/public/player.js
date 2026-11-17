@@ -289,6 +289,56 @@
 
         const playlistSnapshots = new Map();
 
+        const fileListCache = new Map();
+        const fileListInFlight = new Map();
+        const FILE_LIST_TTL = 3000;
+
+        const normalizeFolderUri = (u) => {
+            let s = String(u || '').split('?')[0].split('#')[0];
+            if (!s.startsWith('/')) s = '/' + s;
+            s = s.replace(/\/+/g, '/');
+            if (!s.endsWith('/')) s += '/';
+            try { s = decodeURI(s); } catch {}
+            return s;
+        };
+
+        const getNativeFolderList = (folderUri) => {
+            const st = window.HFS && window.HFS.state;
+            if (!st || st.loading || !Array.isArray(st.list)) return null;
+            if (normalizeFolderUri(st.uri || '') !== normalizeFolderUri(folderUri)) return null;
+            return st.list;
+        };
+
+        const waitForNativeFolderList = (folderUri, timeout = 1200) => {
+            const st = window.HFS && window.HFS.state;
+            if (!st) return Promise.resolve(null);
+            if (normalizeFolderUri(st.uri || '') !== normalizeFolderUri(folderUri)) return Promise.resolve(null);
+            if (!st.loading && Array.isArray(st.list)) return Promise.resolve(st.list);
+            if (!window.HFS || typeof window.HFS.watchState !== 'function') return Promise.resolve(null);
+
+            return new Promise(resolve => {
+                let done = false;
+                let off = null;
+                let timer = null;
+                const finish = value => {
+                    if (done) return;
+                    done = true;
+                    if (timer) clearTimeout(timer);
+                    try { off && off(); } catch {}
+                    resolve(value);
+                };
+                const check = () => {
+                    const s = window.HFS && window.HFS.state;
+                    if (!s || normalizeFolderUri(s.uri || '') !== normalizeFolderUri(folderUri)) return finish(null);
+                    if (s.loading) return;
+                    if (Array.isArray(s.list)) finish(s.list);
+                };
+                try { off = window.HFS.watchState('loading', check, false); } catch {}
+                timer = setTimeout(() => finish(null), timeout);
+                check();
+            });
+        };
+
         const loopStateByUrl = new Map();
 
         // HLS library loader (hls.light.min.js preloaded by plugin.js).
@@ -1211,6 +1261,67 @@ const compareByNumbersThenDate = (a, b) => {
             }
         };
 
+        const isVideoName = (name) => {
+            if (!name) return false;
+            const ext = name.substring(name.lastIndexOf('.')).toLowerCase();
+            return VIDEO_EXTS.includes(ext)
+                || (C.enableHLS && (ext === '.m3u8' || ext === '.mkv'));
+        };
+
+        const toPlaylistTimestamp = (v) => {
+            if (!v) return null;
+            const t = Date.parse(v);
+            return isNaN(t) ? null : t;
+        };
+
+        const entryToPlaylistItem = (it, folderUri) => {
+            const name = it && (it.n || it.name);
+            if (!name || !isVideoName(name)) return null;
+            return {
+                name,
+                url: folderUri + name,
+                size: (it.s !== undefined && it.s !== null) ? it.s : (it.size !== undefined ? it.size : null),
+                mtime: toPlaylistTimestamp(it.m),
+                comment: (it.comment !== undefined && it.comment !== null && String(it.comment).trim() !== '')
+                    ? String(it.comment)
+                    : null,
+                episode: extractEpisode(name),
+            };
+        };
+
+        const fetchFileListFor = async (folderUri, force = false) => {
+            const native = await waitForNativeFolderList(folderUri);
+            if (native) return native;
+
+            const key = normalizeFolderUri(folderUri);
+            if (!force) {
+                const cached = fileListCache.get(key);
+                if (cached && Date.now() - cached.ts < FILE_LIST_TTL) return cached.list;
+            }
+            if (fileListInFlight.has(key)) return fileListInFlight.get(key);
+
+            const request = (async () => {
+                const apiUrl = `/~/api/get_file_list?uri=${encodeURIComponent(folderUri)}`;
+                const res = await fetch(apiUrl, {
+                    credentials: 'same-origin',
+                    headers: { 'Accept': 'application/json' },
+                    cache: 'no-store'
+                });
+                if (!res.ok) throw new Error('get_file_list ' + res.status);
+                const data = await res.json();
+                const list = data && data.list ? data.list : [];
+                fileListCache.set(key, { list, ts: Date.now() });
+                return list;
+            })();
+
+            fileListInFlight.set(key, request);
+            try {
+                return await request;
+            } finally {
+                if (fileListInFlight.get(key) === request) fileListInFlight.delete(key);
+            }
+        };
+
         const fetchFolderVideos = async (src, forceRefresh = false) => {
             const clean = src.split('?')[0];
             const lastSlash = clean.lastIndexOf('/');
@@ -1226,56 +1337,12 @@ const compareByNumbersThenDate = (a, b) => {
             }
 
             try {
-                const apiUrl = `/~/api/get_file_list?uri=${encodeURIComponent(folderUri)}&_t=${Date.now()}`;
-                const res = await fetch(apiUrl, {
-                    credentials: 'same-origin',
-                    headers: { 'Accept': 'application/json' },
-                    cache: 'no-store'
-                });
-                if (!res.ok) return folderCache.get(folderUri) || [];
-                const data = await res.json();
-                const list = data && data.list ? data.list : [];
-
-                const isVideo = (name) => {
-                    if (!name) return false;
-                    const ext = name.substring(name.lastIndexOf('.')).toLowerCase();
-                    return VIDEO_EXTS.includes(ext)
-                        || (C.enableHLS && (ext === '.m3u8' || ext === '.mkv'));
-                };
-
-                const toTs = v => { if (!v) return null; const t = Date.parse(v); return isNaN(t) ? null : t; };
-
+                const list = await fetchFileListFor(folderUri, forceRefresh);
                 const items = list
-                    .filter(it => it && it.n && isVideo(it.n))
-                    .map(it => {
-                        const url = folderUri + it.n;
-                        return {
-                            name: it.n,
-                            url,
-                            size: (it.s !== undefined && it.s !== null) ? it.s : null,
-                            mtime: toTs(it.m),
-                            comment: (it.comment !== undefined && it.comment !== null && String(it.comment).trim() !== '')
-                                ? String(it.comment)
-                                : null,
-                            episode: extractEpisode(it.n),
-                        };
-                    });
-
-                const hfsList = (window.HFS && window.HFS.state && window.HFS.state.list) || [];
-                let ordered = items;
-                if (hfsList.length > 0) {
-                    const byName = new Map();
-                    items.forEach(it => byName.set(it.name, it));
-                    ordered = [];
-                    hfsList.forEach(e => {
-                        const n = e && (e.n || e.name);
-                        if (n && byName.has(n)) { ordered.push(byName.get(n)); byName.delete(n); }
-                    });
-                    byName.forEach(it => ordered.push(it));
-                }
-
-                folderCache.set(folderUri, ordered);
-                return ordered;
+                    .map(it => entryToPlaylistItem(it, folderUri))
+                    .filter(Boolean);
+                folderCache.set(folderUri, items);
+                return items;
             } catch (e) {
                 console.warn('[VideoJS] fetchFolderVideos failed:', e);
                 return folderCache.get(folderUri) || [];
@@ -1393,20 +1460,15 @@ const compareByNumbersThenDate = (a, b) => {
 
         const patchLockFromHfsState = (folderUri, lock) => {
             if (!lock) return false;
-            const hfsList = (window.HFS && window.HFS.state && window.HFS.state.list) || [];
-            if (!hfsList.length) return false;
-
-            const isVideo = (name) => {
-                if (!name) return false;
-                const ext = name.substring(name.lastIndexOf('.')).toLowerCase();
-                return VIDEO_EXTS.includes(ext)
-                    || (C.enableHLS && (ext === '.m3u8' || ext === '.mkv'));
-            };
+            const st = window.HFS && window.HFS.state;
+            if (!st || st.loading || !Array.isArray(st.list)) return false;
+            if (normalizeFolderUri(st.uri || '') !== normalizeFolderUri(folderUri)) return false;
+            const hfsList = st.list;
 
             const hfsByName = new Map();
             hfsList.forEach(e => {
                 const n = e && (e.n || e.name);
-                if (n && isVideo(n)) hfsByName.set(n, e);
+                if (n && isVideoName(n)) hfsByName.set(n, e);
             });
 
             let changed = false;
@@ -1430,7 +1492,20 @@ const compareByNumbersThenDate = (a, b) => {
                     changed = true;
                 }
             }
-            if (nextOrder.length !== lock.order.length) {
+
+            const seen = new Set(nextOrder);
+            for (const entry of hfsList) {
+                const n = entry && (entry.n || entry.name);
+                if (!n || !isVideoName(n) || seen.has(n)) continue;
+                const item = entryToPlaylistItem(entry, folderUri);
+                if (!item) continue;
+                lock.map[n] = item;
+                nextOrder.push(n);
+                seen.add(n);
+                changed = true;
+            }
+
+            if (nextOrder.length !== lock.order.length || nextOrder.some((n, i) => n !== lock.order[i])) {
                 lock.order = nextOrder;
                 changed = true;
             }
@@ -1446,27 +1521,12 @@ const compareByNumbersThenDate = (a, b) => {
             if (!lock) return;
 
             try {
-                const apiUrl = `/~/api/get_file_list?uri=${encodeURIComponent(folderUri)}&_t=${Date.now()}`;
-                const res = await fetch(apiUrl, {
-                    credentials: 'same-origin',
-                    headers: { 'Accept': 'application/json' },
-                    cache: 'no-store'
-                });
-                if (!res.ok) return;
-                const data = await res.json();
-                const list = data && data.list ? data.list : [];
-
-                const isVideo = (name) => {
-                    if (!name) return false;
-                    const ext = name.substring(name.lastIndexOf('.')).toLowerCase();
-                    return VIDEO_EXTS.includes(ext)
-                        || (C.enableHLS && (ext === '.m3u8' || ext === '.mkv'));
-                };
+                const list = await fetchFileListFor(folderUri, true);
 
                 const byName = new Map();
                 list.forEach(it => {
                     const n = it && (it.n || it.name);
-                    if (n && isVideo(n)) byName.set(n, it);
+                    if (n && isVideoName(n)) byName.set(n, it);
                 });
 
                 let changed = false;
@@ -1519,6 +1579,23 @@ const compareByNumbersThenDate = (a, b) => {
         };
 
         let dialogCloseObserver = null;
+        let playlistHfsSyncTimer = 0;
+        const syncCurrentPlaylistFromHfs = (delay = 60) => {
+            if (playlistHfsSyncTimer) clearTimeout(playlistHfsSyncTimer);
+            playlistHfsSyncTimer = setTimeout(() => {
+                playlistHfsSyncTimer = 0;
+                const fu = getCurrentFileShowFolderUri();
+                if (!fu) return;
+                const lock = playlistSnapshots.get(fu);
+                if (!lock) return;
+                if (patchLockFromHfsState(fu, lock)) {
+                    window.dispatchEvent(new CustomEvent('vjs-playlist-refresh', {
+                        detail: { folderUri: fu },
+                    }));
+                }
+            }, delay);
+        };
+
         const ensureDialogCloseObserver = () => {
             if (dialogCloseObserver) return;
 
@@ -1537,12 +1614,7 @@ const compareByNumbersThenDate = (a, b) => {
             dialogCloseObserver = new MutationObserver(() => {
                 const nowHas = countActionDialogs() > 0;
                 if (hadActionDialog && !nowHas) {
-                    const fu = getCurrentFileShowFolderUri();
-                    if (fu) {
-                        setTimeout(() => { refreshSnapshotFromServer(fu); }, 300);
-                        setTimeout(() => { refreshSnapshotFromServer(fu); }, 800);
-                        setTimeout(() => { refreshSnapshotFromServer(fu); }, 2000);
-                    }
+                    syncCurrentPlaylistFromHfs(150);
                 }
                 hadActionDialog = nowHas;
             });
@@ -1564,11 +1636,7 @@ const compareByNumbersThenDate = (a, b) => {
                     s: e && e.s
                 })));
                 if (lastJson && json !== lastJson) {
-                    const fu = getCurrentFileShowFolderUri();
-                    if (fu) {
-                        setTimeout(() => { refreshSnapshotFromServer(fu); }, 100);
-                        setTimeout(() => { refreshSnapshotFromServer(fu); }, 500);
-                    }
+                    syncCurrentPlaylistFromHfs(80);
                 }
                 lastJson = json;
             };
@@ -1878,26 +1946,22 @@ const compareByNumbersThenDate = (a, b) => {
                     const lock = playlistSnapshots.get(folderUri);
                     if (!lock) return;
 
-                    const hfsList = (window.HFS && window.HFS.state && window.HFS.state.list) || [];
-                    if (!hfsList.length) return;
-
-                    const isVideo = (name) => {
-                        if (!name) return false;
-                        const ext = name.substring(name.lastIndexOf('.')).toLowerCase();
-                        return VIDEO_EXTS.includes(ext)
-                            || (C.enableHLS && (ext === '.m3u8' || ext === '.mkv'));
-                    };
+                    const st = window.HFS && window.HFS.state;
+                    if (!st || st.loading || !Array.isArray(st.list)) return;
+                    if (normalizeFolderUri(st.uri || '') !== normalizeFolderUri(folderUri)) return;
+                    const hfsList = st.list;
 
                     const hfsByName = new Map();
                     hfsList.forEach(e => {
                         const n = e && (e.n || e.name);
-                        if (n && isVideo(n)) hfsByName.set(n, e);
+                        if (n && isVideoName(n)) hfsByName.set(n, e);
                     });
 
                     const prevOrder = lock.order;
                     const nextOrder = [];
                     let removedAny = false;
                     let removedCurrent = false;
+                    let changed = false;
                     const currentFilename = getCurrentFilename(playerRef.current, src);
 
                     for (const name of prevOrder) {
@@ -1911,25 +1975,38 @@ const compareByNumbersThenDate = (a, b) => {
                                 const newSize = (entry.s !== undefined && entry.s !== null) ? entry.s : cur.size;
                                 if (newComment !== cur.comment || newSize !== cur.size) {
                                     lock.map[name] = { ...cur, comment: newComment, size: newSize };
+                                    changed = true;
                                 }
                             }
                         } else {
                             removedAny = true;
                             if (name === currentFilename) removedCurrent = true;
                             delete lock.map[name];
+                            changed = true;
                         }
                     }
 
-                    if (!removedAny) {
-                        playlistSnapshots.set(folderUri, lock);
-                        return;
+                    const seen = new Set(nextOrder);
+                    for (const entry of hfsList) {
+                        const n = entry && (entry.n || entry.name);
+                        if (!n || !isVideoName(n) || seen.has(n)) continue;
+                        const item = entryToPlaylistItem(entry, folderUri);
+                        if (!item) continue;
+                        lock.map[n] = item;
+                        nextOrder.push(n);
+                        seen.add(n);
+                        changed = true;
                     }
 
-                    lock.order = nextOrder;
+                    if (nextOrder.length !== prevOrder.length || nextOrder.some((n, i) => n !== prevOrder[i])) {
+                        lock.order = nextOrder;
+                        changed = true;
+                    }
+
+                    if (!changed) return;
+
                     playlistSnapshots.set(folderUri, lock);
                     setItems(deriveItemsFromLock(lock));
-
-                    refreshSnapshotFromServer(folderUri);
 
                     if (removedCurrent && !autoAdvancingRef.current) {
                         const player = playerRef.current;
@@ -1979,7 +2056,7 @@ const compareByNumbersThenDate = (a, b) => {
                 const listEl = document.querySelector('.list');
                 if (listEl) {
                     observer = new MutationObserver(scheduleSync);
-                    observer.observe(listEl, { childList: true, subtree: true });
+                    observer.observe(listEl, { childList: true, subtree: true, characterData: true });
                 }
 
                 const interval = setInterval(scheduleSync, 2500);

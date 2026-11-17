@@ -1,5 +1,5 @@
 exports.description = "A simplified & lightweight Video.js player plugin, modified from VenB304/videojs-player.";
-exports.version = 3.4;
+exports.version = 3.5;
 exports.apiRequired = 10.0;
 exports.repo = "Hug3O/Videos-player+";
 exports.frontend_css = [
@@ -67,21 +67,21 @@ exports.config = {
     },
     hotkeySeekStep: {
         showIf: x => x.config_tab === 'interaction',
-        type: 'number', defaultValue: 5, min: 1,
+        type: 'number', defaultValue: 3, min: 1,
         label: "Arrow Key Seek Time",
         helperText: "Seconds to skip when pressing Left/Right arrows.",
         frontend: true
     },
     scrollSeekStep: {
         showIf: x => x.config_tab === 'interaction',
-        type: 'number', defaultValue: 1, min: 0.1, step: 0.1,
+        type: 'number', defaultValue: 3, min: 0.1, step: 0.1,
         label: "Scroll Seek Step (Seconds)",
         helperText: "How many seconds to jump per wheel notch. Supports decimals, e.g. 0.2 or 0.5.",
         frontend: true
     },
     doubleTapSeekSeconds: {
         showIf: x => x.config_tab === 'interaction',
-        type: 'number', defaultValue: 5, min: 1,
+        type: 'number', defaultValue: 3, min: 1,
         label: "Double Tap Seconds",
         helperText: "Time skipped per double-tap.",
         frontend: true
