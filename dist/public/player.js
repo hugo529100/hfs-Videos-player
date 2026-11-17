@@ -57,6 +57,14 @@
         const SEEK_FF_MIN_SECONDS = 0.3;
         const SEEK_FF_MAX_SECONDS = 10;
         const SEEK_FF_MAX_EXTEND_SECONDS = 30;
+        // A discrete forward command (wheel notch / key press / double tap) may
+        // extend an ongoing fast-forward only this many times. Beyond that the
+        // target stops growing so the scan cannot run away for tens of seconds
+        // and become hard to brake. Backward presses use the same limit per
+        // quick burst.
+        const SEEK_FF_MAX_STACKS = 5;
+        const SEEK_REWIND_MAX_STACKS = 5;
+        const SEEK_REWIND_WINDOW_MS = 900;
         const SEEK_FF_MIN_RATE = 2;
         const SEEK_FF_MAX_RATE = 8;
         const SEEK_FF_TARGET_MS = 500;
@@ -65,6 +73,8 @@
         const seekFastForward = {
             player: null,
             target: 0,
+            startTime: 0,
+            stacks: 0,
             savedRate: 1,
             raf: 0,
             timer: 0,
@@ -112,6 +122,34 @@
             if (player && !player.isDisposed()) player.currentTime(time);
         };
 
+        // Backward seeks are instant jumps; cap how many can be stacked in a
+        // quick burst, and let an opposite (backward) press brake an active
+        // fast-forward instead of seeking.
+        const seekRewindBurst = { count: 0, lastAt: 0 };
+
+        const resetSeekRewindBurst = () => {
+            seekRewindBurst.count = 0;
+            seekRewindBurst.lastAt = 0;
+        };
+
+        const takeSeekRewindSlot = () => {
+            const now = performance.now();
+            if (now - seekRewindBurst.lastAt > SEEK_REWIND_WINDOW_MS) {
+                seekRewindBurst.count = 0;
+            }
+            if (seekRewindBurst.count >= SEEK_REWIND_MAX_STACKS) return false;
+            seekRewindBurst.count += 1;
+            seekRewindBurst.lastAt = now;
+            return true;
+        };
+
+        const brakeFastForward = (player) => {
+            if (seekFastForward.player !== player) return false;
+            seekFastForwardStop('brake');
+            resetSeekRewindBurst();
+            return true;
+        };
+
         // While a fast-forward scan is running, repeated seeks must add to the
         // pending target instead of the moving playhead, otherwise each wheel
         // notch / key press would only add a fraction of its step.
@@ -120,17 +158,28 @@
             return player.currentTime();
         };
 
-        const seekFastForwardTo = (player, target) => {
+        const seekFastForwardTo = (player, target, discrete = true) => {
             if (!player || player.isDisposed()) return false;
             const duration = player.duration();
             if (!isFinite(duration) || duration <= 0) return false;
             target = Math.max(0, Math.min(target, duration - 0.15));
             const current = player.currentTime();
             const delta = target - current;
+            if (delta > 0) resetSeekRewindBurst();
 
             // Already scanning: extend the target, or hand back to a direct seek.
             if (seekFastForward.player === player) {
-                if (delta <= 0.15 || delta > SEEK_FF_MAX_EXTEND_SECONDS) {
+                if (delta <= 0.15) {
+                    seekFastForwardStop('cancel');
+                    return false;
+                }
+                if (discrete) {
+                    if (seekFastForward.stacks >= SEEK_FF_MAX_STACKS ||
+                        target - seekFastForward.startTime > SEEK_FF_MAX_EXTEND_SECONDS) {
+                        return 'capped';
+                    }
+                    seekFastForward.stacks += 1;
+                } else if (target - seekFastForward.startTime > SEEK_FF_MAX_EXTEND_SECONDS) {
                     seekFastForwardStop('cancel');
                     return false;
                 }
@@ -149,7 +198,11 @@
 
             seekFastForward.player = player;
             seekFastForward.target = target;
+            seekFastForward.startTime = current;
+            seekFastForward.stacks = 1;
             seekFastForward.savedRate = player.playbackRate() || 1;
+            seekHint.total = 0;
+            seekHint.lastAt = 0;
 
             const rate = Math.max(SEEK_FF_MIN_RATE, Math.min(SEEK_FF_MAX_RATE,
                 delta / (SEEK_FF_TARGET_MS / 1000)));
@@ -213,9 +266,15 @@
         const showSeekHint = (player, seconds, hold) => {
             if (!player || player.isDisposed() || !seconds) return false;
             const now = performance.now();
-            const sameSign = (seekHint.total > 0) === (seconds > 0);
-            if (sameSign && now - seekHint.lastAt < 900) seekHint.total += seconds;
-            else seekHint.total = seconds;
+            if (seekFastForward.player === player) {
+                // While a scan runs, show the real distance from where the scan
+                // started (summing per-command steps would overstate a drag).
+                seekHint.total = seekFastForward.target - seekFastForward.startTime;
+            } else {
+                const sameSign = (seekHint.total > 0) === (seconds > 0);
+                if (sameSign && now - seekHint.lastAt < 900) seekHint.total += seconds;
+                else seekHint.total = seconds;
+            }
             if (!seekHint.total) {
                 clearSeekHint();
                 return true;
@@ -2511,15 +2570,17 @@ const compareByNumbersThenDate = (a, b) => {
                     const seekSeconds = doubleTapSeekSeconds;
 
                     if (pctX < 0.3) {
-                        seekDirect(player, Math.max(0, player.currentTime() - seekSeconds));
-                        if (!showSeekHint(player, -seekSeconds)) {
-                            notify(player, `Rewind ${seekSeconds}s`, "info", 1000);
+                        if (!brakeFastForward(player) && takeSeekRewindSlot()) {
+                            seekDirect(player, Math.max(0, player.currentTime() - seekSeconds));
+                            if (!showSeekHint(player, -seekSeconds)) {
+                                notify(player, `Rewind ${seekSeconds}s`, "info", 1000);
+                            }
                         }
                     } else if (pctX > 0.7) {
                         const target = seekForwardBase(player) + seekSeconds;
-                        if (!seekFastForwardTo(player, target)) seekDirect(player, target);
-                        const hold = seekFastForward.player === player;
-                        if (!showSeekHint(player, seekSeconds, hold)) {
+                        const res = seekFastForwardTo(player, target);
+                        if (res === false) seekDirect(player, target);
+                        if (res !== 'capped' && !showSeekHint(player, seekSeconds, res === true)) {
                             notify(player, `Forward ${seekSeconds}s`, "info", 1000);
                         }
                     } else {
@@ -2659,7 +2720,9 @@ const compareByNumbersThenDate = (a, b) => {
                 const player = this.player_;
                 if (!player || player.isDisposed()) return originalUserSeek.call(this, time);
                 const delta = time - player.currentTime();
-                if (seekFastForwardTo(player, time)) {
+                const res = seekFastForwardTo(player, time, false);
+                if (res === 'capped') return;
+                if (res) {
                     if (delta) showSeekHint(player, delta, true);
                     return;
                 }
@@ -2697,18 +2760,20 @@ const compareByNumbersThenDate = (a, b) => {
                         break;
                     case 'ArrowLeft':
                         e.preventDefault(); e.stopPropagation();
-                        seekDirect(player, player.currentTime() - hotkeySeekStep);
-                        if (!showSeekHint(player, -hotkeySeekStep)) {
-                            notify(player, `Rewind ${hotkeySeekStep}s`, "info", 500);
+                        if (!brakeFastForward(player) && takeSeekRewindSlot()) {
+                            seekDirect(player, player.currentTime() - hotkeySeekStep);
+                            if (!showSeekHint(player, -hotkeySeekStep)) {
+                                notify(player, `Rewind ${hotkeySeekStep}s`, "info", 500);
+                            }
                         }
                         break;
                     case 'ArrowRight':
                         e.preventDefault(); e.stopPropagation();
                         {
                             const target = seekForwardBase(player) + hotkeySeekStep;
-                            if (!seekFastForwardTo(player, target)) seekDirect(player, target);
-                            const hold = seekFastForward.player === player;
-                            if (!showSeekHint(player, hotkeySeekStep, hold)) {
+                            const res = seekFastForwardTo(player, target);
+                            if (res === false) seekDirect(player, target);
+                            if (res !== 'capped' && !showSeekHint(player, hotkeySeekStep, res === true)) {
                                 notify(player, `Forward ${hotkeySeekStep}s`, "info", 500);
                             }
                         }
@@ -3168,15 +3233,18 @@ const compareByNumbersThenDate = (a, b) => {
                             const base = dir > 0 ? seekForwardBase(player) : player.currentTime();
                             let newTime = base + dir * step;
                             newTime = Math.max(0, Math.min(duration || newTime, newTime));
-                            if (dir > 0) {
-                                if (!seekFastForwardTo(player, newTime)) seekDirect(player, newTime);
-                            } else {
-                                seekDirect(player, newTime);
-                            }
                             player.userActive(true);
-                            const hold = seekFastForward.player === player;
-                            if (!showSeekHint(player, dir * step, hold)) {
-                                notify(player, `Seek ${dir > 0 ? '+' : '-'}${step}s`, "info", 500);
+                            if (dir > 0) {
+                                const res = seekFastForwardTo(player, newTime);
+                                if (res === false) seekDirect(player, newTime);
+                                if (res !== 'capped' && !showSeekHint(player, step, res === true)) {
+                                    notify(player, `Seek +${step}s`, "info", 500);
+                                }
+                            } else if (!brakeFastForward(player) && takeSeekRewindSlot()) {
+                                seekDirect(player, newTime);
+                                if (!showSeekHint(player, -step)) {
+                                    notify(player, `Seek -${step}s`, "info", 500);
+                                }
                             }
                         }
                     };
