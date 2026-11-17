@@ -33,13 +33,6 @@ exports.config = {
     // ============================================
     // === 1. General ===
     // ============================================
-    loop: {
-        showIf: x => x.config_tab === 'general',
-        type: 'boolean', defaultValue: false,
-        label: "Loop Playback",
-        helperText: "Automatically replay the video when it ends.",
-        frontend: true
-    },
     resumePlayback: {
         showIf: x => x.config_tab === 'general',
         type: 'boolean', defaultValue: false,
@@ -61,13 +54,6 @@ exports.config = {
         helperText: "'Overlay' covers the player. 'Toast' shows a popup message.",
         frontend: true
     },
-    playlistPanel: {
-        showIf: x => x.config_tab === 'general',
-        type: 'boolean', defaultValue: true,
-        label: "Show Playlist Panel",
-        helperText: "Show a PotPlayer-style playlist on the right (desktop) or bottom (mobile portrait).",
-        frontend: true
-    },
 
     // ============================================
     // === 2. Interaction ===
@@ -76,7 +62,7 @@ exports.config = {
         showIf: x => x.config_tab === 'interaction',
         type: 'boolean', defaultValue: true,
         label: "Enable Keyboard Hotkeys",
-        helperText: "Space (Pause), F (Fullscreen), Arrows (Seek).",
+        helperText: "Space (Play/Pause), F (Fullscreen), ←/→ (Seek), ↑/↓ (Previous/Next Video).",
         frontend: true
     },
     hotkeySeekStep: {
@@ -84,14 +70,6 @@ exports.config = {
         type: 'number', defaultValue: 5, min: 1,
         label: "Arrow Key Seek Time",
         helperText: "Seconds to skip when pressing Left/Right arrows.",
-        frontend: true
-    },
-    arrowKeysAction: {
-        showIf: x => x.config_tab === 'interaction',
-        type: 'select', defaultValue: 'seek',
-        options: { 'Seek Video (Default)': 'seek', 'Next/Prev File (HFS Navigation)': 'navigate' },
-        label: "Arrow Key Behavior",
-        helperText: "Choose between seeking the video or navigating to the next file.",
         frontend: true
     },
     scrollSeekStep: {

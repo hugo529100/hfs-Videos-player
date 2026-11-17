@@ -30,7 +30,6 @@
             preload: 'metadata',
             enableHLS: true,
 
-            loop: rawConfig.loop ?? false,
             enableHotkeys: rawConfig.enableHotkeys ?? true,
             hotkeySeekStep: parseInt(rawConfig.hotkeySeekStep) || 5,
             resumePlayback: rawConfig.resumePlayback ?? true,
@@ -41,12 +40,249 @@
             enable_ffmpeg_transcoding: rawConfig.enable_ffmpeg_transcoding ?? false,
             enable_transcoding_seeking: rawConfig.enable_transcoding_seeking ?? false,
             enableSubtitlePluginIntegration: rawConfig.enableSubtitlePluginIntegration ?? true,
-            arrowKeysAction: rawConfig.arrowKeysAction || 'seek',
-            playlistPanel: rawConfig.playlistPanel ?? true,
         };
 
         const BRAKE_SEEK_THRESHOLD = 30;
         const VIDEO_EXTS = ['.mp4', '.webm', '.ogv', '.mov'];
+
+        // ============================================================
+        // === Fast-forward seeking (smooth seek) ===
+        // ============================================================
+        // A small forward seek (arrow key, wheel, double tap, progress bar)
+        // plays the skipped part at a high rate and stops on the target time
+        // instead of jumping there, so the picture and sound fast-forward
+        // through the preloaded part. Long jumps and backward seeks keep the
+        // instant behaviour; a paused player is never touched, so scrubbing a
+        // paused video still shows the usual still-frame preview.
+        const SEEK_FF_MIN_SECONDS = 0.3;
+        const SEEK_FF_MAX_SECONDS = 10;
+        const SEEK_FF_MAX_EXTEND_SECONDS = 30;
+        const SEEK_FF_MIN_RATE = 2;
+        const SEEK_FF_MAX_RATE = 8;
+        const SEEK_FF_TARGET_MS = 500;
+        const SEEK_FF_TIMEOUT_MS = 4000;
+
+        const seekFastForward = {
+            player: null,
+            target: 0,
+            savedRate: 1,
+            raf: 0,
+            timer: 0,
+            onPause: null,
+            onEnded: null,
+        };
+
+        const isForwardBuffered = (player, target) => {
+            try {
+                const buffered = player.buffered();
+                if (!buffered || !buffered.length) return true;
+                const current = player.currentTime();
+                for (let i = buffered.length - 1; i >= 0; i--) {
+                    if (buffered.start(i) <= current + 0.5) {
+                        return target <= buffered.end(i) + 0.5;
+                    }
+                }
+            } catch (e) {}
+            return true;
+        };
+
+        const seekFastForwardStop = (reason) => {
+            const state = seekFastForward;
+            const player = state.player;
+            if (!player) return;
+            state.player = null;
+            if (state.raf) { cancelAnimationFrame(state.raf); state.raf = 0; }
+            if (state.timer) { clearTimeout(state.timer); state.timer = 0; }
+            if (player.isDisposed && player.isDisposed()) return;
+            if (state.onPause) { player.off('pause', state.onPause); state.onPause = null; }
+            if (state.onEnded) { player.off('ended', state.onEnded); state.onEnded = null; }
+
+            try { player.playbackRate(state.savedRate); } catch (e) {}
+
+            if (reason === 'timeout') {
+                try {
+                    if (state.target - player.currentTime() > 0.25) player.currentTime(state.target);
+                } catch (e) {}
+            }
+            releaseSeekHint();
+        };
+
+        const seekDirect = (player, time) => {
+            if (seekFastForward.player === player) seekFastForwardStop('cancel');
+            if (player && !player.isDisposed()) player.currentTime(time);
+        };
+
+        // While a fast-forward scan is running, repeated seeks must add to the
+        // pending target instead of the moving playhead, otherwise each wheel
+        // notch / key press would only add a fraction of its step.
+        const seekForwardBase = (player) => {
+            if (seekFastForward.player === player) return seekFastForward.target;
+            return player.currentTime();
+        };
+
+        const seekFastForwardTo = (player, target) => {
+            if (!player || player.isDisposed()) return false;
+            const duration = player.duration();
+            if (!isFinite(duration) || duration <= 0) return false;
+            target = Math.max(0, Math.min(target, duration - 0.15));
+            const current = player.currentTime();
+            const delta = target - current;
+
+            // Already scanning: extend the target, or hand back to a direct seek.
+            if (seekFastForward.player === player) {
+                if (delta <= 0.15 || delta > SEEK_FF_MAX_EXTEND_SECONDS) {
+                    seekFastForwardStop('cancel');
+                    return false;
+                }
+                seekFastForward.target = target;
+                const rate = Math.max(SEEK_FF_MIN_RATE, Math.min(SEEK_FF_MAX_RATE,
+                    delta / (SEEK_FF_TARGET_MS / 1000)));
+                try {
+                    if (Math.abs(player.playbackRate() - rate) > 0.4) player.playbackRate(rate);
+                } catch (e) {}
+                return true;
+            }
+
+            if (player.paused() || player.ended()) return false;
+            if (delta < SEEK_FF_MIN_SECONDS || delta > SEEK_FF_MAX_SECONDS) return false;
+            if (!isForwardBuffered(player, target)) return false;
+
+            seekFastForward.player = player;
+            seekFastForward.target = target;
+            seekFastForward.savedRate = player.playbackRate() || 1;
+
+            const rate = Math.max(SEEK_FF_MIN_RATE, Math.min(SEEK_FF_MAX_RATE,
+                delta / (SEEK_FF_TARGET_MS / 1000)));
+            try { player.playbackRate(rate); } catch (e) {}
+
+            const onPause = () => {
+                if (seekFastForward.player === player) seekFastForwardStop('pause');
+            };
+            const onEnded = () => {
+                if (seekFastForward.player === player) seekFastForwardStop('ended');
+            };
+            seekFastForward.onPause = onPause;
+            seekFastForward.onEnded = onEnded;
+            player.on('pause', onPause);
+            player.on('ended', onEnded);
+
+            const startedAt = performance.now();
+            const tick = () => {
+                if (seekFastForward.player !== player) return;
+                if (player.isDisposed() || player.ended()) { seekFastForwardStop('ended'); return; }
+                if (player.currentTime() >= seekFastForward.target - 0.05) {
+                    seekFastForwardStop('reached');
+                    return;
+                }
+                if (performance.now() - startedAt > SEEK_FF_TIMEOUT_MS) {
+                    seekFastForwardStop('timeout');
+                    return;
+                }
+                seekFastForward.raf = requestAnimationFrame(tick);
+            };
+            seekFastForward.raf = requestAnimationFrame(tick);
+            seekFastForward.timer = setTimeout(() => seekFastForwardStop('timeout'), SEEK_FF_TIMEOUT_MS);
+            return true;
+        };
+
+        // Seek feedback takes over the remaining-time countdown next to the
+        // progress bar, showing "+5s" / "−5s" while a seek is triggered. If
+        // that countdown is hidden (very small layouts), fall back to a small
+        // floating badge above the progress bar.
+        const seekHint = {
+            el: null,
+            badge: null,
+            total: 0,
+            timer: 0,
+            lastAt: 0,
+        };
+
+        const clearSeekHint = () => {
+            seekHint.total = 0;
+            if (seekHint.el) {
+                seekHint.el.classList.remove('is-seek-hint');
+                seekHint.el.removeAttribute('data-seek-hint');
+                seekHint.el = null;
+            }
+            if (seekHint.badge) {
+                seekHint.badge.classList.remove('is-visible');
+                seekHint.badge = null;
+            }
+        };
+
+        const showSeekHint = (player, seconds, hold) => {
+            if (!player || player.isDisposed() || !seconds) return false;
+            const now = performance.now();
+            const sameSign = (seekHint.total > 0) === (seconds > 0);
+            if (sameSign && now - seekHint.lastAt < 900) seekHint.total += seconds;
+            else seekHint.total = seconds;
+            if (!seekHint.total) {
+                clearSeekHint();
+                return true;
+            }
+            // Ignore single tiny deltas (progress-bar drag emits many); keep
+            // accumulating until the change is worth showing.
+            if (Math.abs(seekHint.total) < 0.3) return true;
+
+            const absTotal = Math.abs(seekHint.total);
+            const shownTotal = absTotal >= 10 ? Math.round(absTotal) : Math.round(absTotal * 10) / 10;
+            const text = (seekHint.total > 0 ? '+' : '\u2212') + shownTotal + 's';
+            const controlBar = player.getChild && player.getChild('controlBar');
+            if (!controlBar) return false;
+
+            // Preferred: reuse the remaining-time countdown's slot.
+            const remaining = controlBar.getChild && controlBar.getChild('remainingTimeDisplay');
+            const remainingEl = remaining && remaining.el && remaining.el();
+            const canUseRemaining = remainingEl && remainingEl.getClientRects().length > 0;
+
+            if (seekHint.badge) {
+                seekHint.badge.classList.remove('is-visible');
+                seekHint.badge = null;
+            }
+            if (seekHint.el && seekHint.el !== remainingEl) {
+                seekHint.el.classList.remove('is-seek-hint');
+                seekHint.el.removeAttribute('data-seek-hint');
+                seekHint.el = null;
+            }
+
+            if (canUseRemaining) {
+                seekHint.el = remainingEl;
+                seekHint.el.classList.add('is-seek-hint');
+                seekHint.el.setAttribute('data-seek-hint', text);
+            } else {
+                const progress = controlBar.getChild && controlBar.getChild('progressControl');
+                const host = progress && progress.el && progress.el();
+                if (!host) return false;
+                let badge = host.querySelector('.vjs-seek-hint');
+                if (!badge) {
+                    badge = document.createElement('div');
+                    badge.className = 'vjs-seek-hint';
+                    host.appendChild(badge);
+                }
+                badge.textContent = text;
+                badge.classList.add('is-visible');
+                seekHint.badge = badge;
+            }
+
+            try { player.userActive(true); } catch (e) {}
+            seekHint.lastAt = now;
+            if (seekHint.timer) { clearTimeout(seekHint.timer); seekHint.timer = 0; }
+            if (!hold) {
+                seekHint.timer = setTimeout(() => {
+                    seekHint.timer = 0;
+                    clearSeekHint();
+                }, 750);
+            }
+            return true;
+        };
+
+        const releaseSeekHint = (delay = 260) => {
+            if (seekHint.timer) { clearTimeout(seekHint.timer); seekHint.timer = 0; }
+            seekHint.timer = setTimeout(() => {
+                seekHint.timer = 0;
+                clearSeekHint();
+            }, delay);
+        };
 
         const folderCache = new Map();
         const listScrollCache = new Map();
@@ -923,6 +1159,56 @@ const compareByNumbersThenDate = (a, b) => {
                     else if (dialogEl.parentNode) dialogEl.parentNode.removeChild(dialogEl);
                 }, fade);
             }, delay);
+        };
+
+        // HFS pushes one history entry for every file-show dialog it opens.
+        // The playlist opens a new dialog whenever it switches item, so every
+        // jump leaves a stale dialog entry behind. On refresh the in-memory
+        // dialog stack is empty while those history entries still carry a
+        // dialog id, so HFS walks back through them and can end up on an
+        // earlier page instead of the folder currently being played.
+        // Swap that single pushState for replaceState: the dialog keeps one
+        // history entry, the older entry is reused, and refreshing always
+        // returns to the folder that is playing.
+        let fileShowHistoryPatch = null;
+        const restoreFileShowHistory = () => {
+            const patch = fileShowHistoryPatch;
+            if (!patch) return;
+            fileShowHistoryPatch = null;
+            if (patch.timer) clearTimeout(patch.timer);
+            if (window.history.pushState === patch.wrapped) {
+                window.history.pushState = patch.originalPush;
+            }
+        };
+
+        const openHfsFileShowReplacingHistory = (entry) => {
+            const h = window.history;
+            if (!h || typeof h.pushState !== 'function' || fileShowHistoryPatch) {
+                HFS.fileShow(entry, { startPlaying: false });
+                return;
+            }
+
+            const originalPush = h.pushState;
+            const wrappedPush = function (state, title, url) {
+                restoreFileShowHistory();
+                try {
+                    return h.replaceState(state, title, url || location.href);
+                } catch (e) {
+                    return originalPush.call(h, state, title, url);
+                }
+            };
+
+            const patch = { originalPush, wrapped: wrappedPush, timer: null };
+            fileShowHistoryPatch = patch;
+            patch.timer = setTimeout(restoreFileShowHistory, 1500);
+            h.pushState = wrappedPush;
+
+            try {
+                HFS.fileShow(entry, { startPlaying: false });
+            } catch (e) {
+                restoreFileShowHistory();
+                throw e;
+            }
         };
 
         const fetchFolderVideos = async (src, forceRefresh = false) => {
@@ -1806,7 +2092,7 @@ const compareByNumbersThenDate = (a, b) => {
                 oldDialogs.forEach(stopVideosIn);
 
                 try {
-                    HFS.fileShow(entry, { startPlaying: false });
+                    openHfsFileShowReplacingHistory(entry);
                 } catch (e) {
                     console.warn('[VideoJS] HFS.fileShow threw:', e);
                     player.src({ src: item.url, type: determineMimeType(item.url) });
@@ -2148,11 +2434,17 @@ const compareByNumbersThenDate = (a, b) => {
                     const seekSeconds = doubleTapSeekSeconds;
 
                     if (pctX < 0.3) {
-                        player.currentTime(Math.max(0, player.currentTime() - seekSeconds));
-                        notify(player, `Rewind ${seekSeconds}s`, "info", 1000);
+                        seekDirect(player, Math.max(0, player.currentTime() - seekSeconds));
+                        if (!showSeekHint(player, -seekSeconds)) {
+                            notify(player, `Rewind ${seekSeconds}s`, "info", 1000);
+                        }
                     } else if (pctX > 0.7) {
-                        player.currentTime(Math.min(player.duration(), player.currentTime() + seekSeconds));
-                        notify(player, `Forward ${seekSeconds}s`, "info", 1000);
+                        const target = seekForwardBase(player) + seekSeconds;
+                        if (!seekFastForwardTo(player, target)) seekDirect(player, target);
+                        const hold = seekFastForward.player === player;
+                        if (!showSeekHint(player, seekSeconds, hold)) {
+                            notify(player, `Forward ${seekSeconds}s`, "info", 1000);
+                        }
                     } else {
                         if (isWrapperFullscreen()) {
                             exitWrapperFullscreen();
@@ -2196,6 +2488,111 @@ const compareByNumbersThenDate = (a, b) => {
             }
         };
 
+        // ============================================================
+        // === Touch seek accuracy (Tree-nav / fixed overlay offset) ===
+        // ============================================================
+        // Video.js 8.10 maps a pointer onto a slider with findPosition(), which only
+        // sums offsetLeft/offsetTop along the offsetParent chain. That chain stops at
+        // a position:fixed ancestor, so the left offset of HFS's
+        // .dialog-backdrop.file-show (equal to the Tree-nav width while it is open)
+        // is not included. Touching the progress bar then seeks to a wrong time even
+        // though the bar is drawn correctly; closing Tree-nav hides that offset and
+        // the seek looks "correct" again. Mouse input was unaffected because it uses
+        // event.offsetX relative to the target.
+        // Map the pointer with the element's live getBoundingClientRect() instead, so
+        // the time axis always follows the bar that is actually displayed and stays
+        // correct after the player is compressed, resized, zoomed or scrolled.
+        const patchSliderPointerMapping = () => {
+            const vjs = window.videojs;
+            if (!vjs || typeof vjs.getComponent !== 'function') return;
+            const Slider = vjs.getComponent('Slider');
+            if (!Slider || !Slider.prototype || Slider.prototype.__hfsRectPointer) return;
+
+            const original = Slider.prototype.calculateDistance;
+            if (typeof original !== 'function') return;
+
+            Slider.prototype.calculateDistance = function (event) {
+                const el = this.el_;
+                if (!el || typeof el.getBoundingClientRect !== 'function') {
+                    return original.call(this, event);
+                }
+
+                const touch = event && event.changedTouches && event.changedTouches[0];
+                const point = touch || event;
+                const clientX = point && point.clientX;
+                const clientY = point && point.clientY;
+                if (typeof clientX !== 'number' || typeof clientY !== 'number') {
+                    return original.call(this, event);
+                }
+
+                const rect = el.getBoundingClientRect();
+                if (!rect || !rect.width || !rect.height) {
+                    return original.call(this, event);
+                }
+
+                if (typeof this.vertical === 'function' && this.vertical()) {
+                    return 1 - Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
+                }
+                return Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+            };
+            Slider.prototype.__hfsRectPointer = true;
+        };
+
+        // The progress bar is handled by video.js' own SeekBar: it pauses on
+        // mousedown/touchstart and moves the playhead with currentTime(), which
+        // makes the picture jump. Keep playback running while scrubbing a
+        // playing video and route its seeks through seekFastForwardTo(), so a
+        // short forward jump fast-forwards to the target instead. Paused
+        // scrubbing keeps video.js' stock still-frame preview.
+        const patchSeekBarFastForward = () => {
+            const vjs = window.videojs;
+            if (!vjs || typeof vjs.getComponent !== 'function') return;
+            const SeekBar = vjs.getComponent('SeekBar');
+            const Slider = vjs.getComponent('Slider');
+            if (!SeekBar || !SeekBar.prototype || SeekBar.prototype.__hfsFastForward) return;
+            const baseMouseDown = Slider && Slider.prototype && Slider.prototype.handleMouseDown;
+            const originalMouseDown = SeekBar.prototype.handleMouseDown;
+            const originalUserSeek = SeekBar.prototype.userSeek_;
+            if (typeof baseMouseDown !== 'function' || typeof originalUserSeek !== 'function') return;
+
+            const isPrimaryPointer = (event) => {
+                if (!event) return false;
+                if (event.button === undefined && event.buttons === undefined) return true;
+                if (event.button === 0 && event.buttons === undefined) return true;
+                if (event.type === 'mouseup' && event.button === 0 && event.buttons === 0) return true;
+                if (event.button === 0 && event.buttons === 1) return true;
+                return false;
+            };
+
+            SeekBar.prototype.handleMouseDown = function (event) {
+                const player = this.player_;
+                if (!player || player.isDisposed() || player.paused() || player.ended() ||
+                    !isPrimaryPointer(event)) {
+                    return originalMouseDown.call(this, event);
+                }
+                // video.js would pause here; keep playing so a short forward
+                // jump can fast-forward (with sound) instead of jumping.
+                event.stopPropagation();
+                if (event.type === 'mousedown') event.preventDefault();
+                this.videoWasPlaying = true;
+                baseMouseDown.call(this, event);
+            };
+
+            SeekBar.prototype.userSeek_ = function (time) {
+                const player = this.player_;
+                if (!player || player.isDisposed()) return originalUserSeek.call(this, time);
+                const delta = time - player.currentTime();
+                if (seekFastForwardTo(player, time)) {
+                    if (delta) showSeekHint(player, delta, true);
+                    return;
+                }
+                if (delta) showSeekHint(player, delta);
+                return originalUserSeek.call(this, time);
+            };
+
+            SeekBar.prototype.__hfsFastForward = true;
+        };
+
         const setupHotkeys = (player, notify, playlistNavRef) => {
             const { enableHotkeys, hotkeySeekStep } = C;
             if (!player || !enableHotkeys) return;
@@ -2222,16 +2619,22 @@ const compareByNumbersThenDate = (a, b) => {
                         }
                         break;
                     case 'ArrowLeft':
-                        if (C.arrowKeysAction === 'navigate') return;
                         e.preventDefault(); e.stopPropagation();
-                        player.currentTime(player.currentTime() - hotkeySeekStep);
-                        notify(player, `Rewind ${hotkeySeekStep}s`, "info", 500);
+                        seekDirect(player, player.currentTime() - hotkeySeekStep);
+                        if (!showSeekHint(player, -hotkeySeekStep)) {
+                            notify(player, `Rewind ${hotkeySeekStep}s`, "info", 500);
+                        }
                         break;
                     case 'ArrowRight':
-                        if (C.arrowKeysAction === 'navigate') return;
                         e.preventDefault(); e.stopPropagation();
-                        player.currentTime(player.currentTime() + hotkeySeekStep);
-                        notify(player, `Forward ${hotkeySeekStep}s`, "info", 500);
+                        {
+                            const target = seekForwardBase(player) + hotkeySeekStep;
+                            if (!seekFastForwardTo(player, target)) seekDirect(player, target);
+                            const hold = seekFastForward.player === player;
+                            if (!showSeekHint(player, hotkeySeekStep, hold)) {
+                                notify(player, `Forward ${hotkeySeekStep}s`, "info", 500);
+                            }
+                        }
                         break;
                     case 'ArrowUp':
                         e.preventDefault(); e.stopPropagation();
@@ -2507,10 +2910,12 @@ const compareByNumbersThenDate = (a, b) => {
 
                 dummyVideo.play = () => Promise.resolve();
 
+                patchSliderPointerMapping();
+                patchSeekBarFastForward();
+
                 const player = videojs(videoElement, {
                     controls: C.controls,
                     autoplay: C.autoplay,
-                    loop: C.loop,
                     muted: false,
                     preload: C.preload,
                     fluid: false,
@@ -2596,9 +3001,13 @@ const compareByNumbersThenDate = (a, b) => {
                     }
                     player.on('volumechange', enforceVolumeState);
 
-                    const insertToggleButton = () => {
-                        if (C.playlistPanel === false) return;
+                    // Changing video while a fast-forward scan is running must
+                    // not leave the new video muted / at 8x.
+                    player.on('loadstart', () => {
+                        if (seekFastForward.player === player) seekFastForwardStop('loadstart');
+                    });
 
+                    const insertToggleButton = () => {
                         const controlBar = player.getChild('controlBar');
                         const controlBarEl = controlBar && controlBar.el();
                         if (!controlBarEl) return;
@@ -2679,11 +3088,19 @@ const compareByNumbersThenDate = (a, b) => {
                             wheelAccum -= dir * WHEEL_NOTCH;
                             const step = C.scrollSeekStep;
                             const duration = player.duration();
-                            let newTime = player.currentTime() + dir * step;
+                            const base = dir > 0 ? seekForwardBase(player) : player.currentTime();
+                            let newTime = base + dir * step;
                             newTime = Math.max(0, Math.min(duration || newTime, newTime));
-                            player.currentTime(newTime);
+                            if (dir > 0) {
+                                if (!seekFastForwardTo(player, newTime)) seekDirect(player, newTime);
+                            } else {
+                                seekDirect(player, newTime);
+                            }
                             player.userActive(true);
-                            notify(player, `Seek ${dir > 0 ? '+' : '-'}${step}s`, "info", 500);
+                            const hold = seekFastForward.player === player;
+                            if (!showSeekHint(player, dir * step, hold)) {
+                                notify(player, `Seek ${dir > 0 ? '+' : '-'}${step}s`, "info", 500);
+                            }
                         }
                     };
                     document.addEventListener('wheel', handleWheel, { passive: false, capture: true });
@@ -2997,7 +3414,7 @@ const compareByNumbersThenDate = (a, b) => {
 
                 const fileShow = wrapper.closest('.file-show');
                 const hiddenNavs = [];
-                if (fileShow && C.playlistPanel !== false) {
+                if (fileShow) {
                     fileShow.querySelectorAll('.nav').forEach(nav => {
                         if (nav.style.display === 'none') return;
                         hiddenNavs.push({ el: nav, display: nav.style.display });
@@ -3030,15 +3447,14 @@ const compareByNumbersThenDate = (a, b) => {
                 return h('div', { style: { width: '100%', height: '100%', minHeight: '150px', display: 'flex', alignItems: 'center', justifyContent: 'center', backgroundColor: '#000', color: '#666', fontFamily: 'sans-serif' } }, 'No Video Selected');
             }
 
-            const showPlaylist = C.playlistPanel !== false;
             const isMobilePortrait = (() => {
                 try { return window.matchMedia('(max-width: 640px) and (orientation: portrait)').matches; } catch { return false; }
             })();
 
             const wrapperClass = 'vjs-player-wrapper'
-                + (showPlaylist ? ' has-playlist' : '')
-                + (showPlaylist && playlistOpen ? ' playlist-open' : '')
-                + (showPlaylist && isMobilePortrait ? ' is-mobile-portrait' : '');
+                + ' has-playlist'
+                + (playlistOpen ? ' playlist-open' : '')
+                + (isMobilePortrait ? ' is-mobile-portrait' : '');
 
             return h('div', {
                 className: wrapperClass,
@@ -3053,7 +3469,7 @@ const compareByNumbersThenDate = (a, b) => {
                 }, [
                     h('video', { ref: dummyVideoRef, className: 'showing', style: { display: 'none' } })
                 ]),
-                showPlaylist && h(PlaylistPanel, {
+                h(PlaylistPanel, {
                     key: 'playlist',
                     src: props.src,
                     playerRef: playerRef,

@@ -688,6 +688,57 @@ body.vjs-full-window {
   font-size: 1em;
 }
 
+/* --- Fast-forward / rewind hint (next to the progress bar) --- */
+.vjs-seek-hint {
+  position: absolute;
+  right: 0;
+  bottom: 100%;
+  margin-bottom: 0.15em;
+  padding: 0.22em 0.55em;
+  border-radius: 0.35em;
+  background-color: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--ghost-contrast);
+  font-size: 1.8em;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(0.35em);
+  transition: opacity 0.16s ease, transform 0.16s ease;
+  z-index: 6;
+}
+
+.vjs-seek-hint.is-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* Use the remaining-time countdown slot for the seek delta. Keeping the
+   original text in the layout (hidden) avoids the control bar jumping. */
+.video-js .vjs-remaining-time.is-seek-hint {
+  position: relative;
+}
+
+.video-js .vjs-remaining-time.is-seek-hint > * {
+  visibility: hidden;
+}
+
+.video-js .vjs-remaining-time.is-seek-hint::after {
+  content: attr(data-seek-hint);
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+
 /* --- Mouse Display --- */
 .video-js .vjs-progress-control .vjs-mouse-display {
   display: none;
