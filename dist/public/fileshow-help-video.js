@@ -161,6 +161,44 @@
         return '<div class="ibhv-divider"></div>';
     }
 
+    function addHelpCloseButton(dialog, onClose) {
+        if (!dialog) return;
+        dialog.classList.add('ibhv-help-dialog');
+        [...dialog.children].forEach(child => {
+            if (child.classList && child.classList.contains('dialog-closer')) {
+                child.style.display = 'none';
+            }
+        });
+        let btn = [...dialog.children].find(child =>
+            child.classList && child.classList.contains('ibhv-close-btn'));
+        if (!btn) {
+            btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'ibhv-close-btn';
+            btn.setAttribute('aria-label', 'Close');
+            btn.setAttribute('title', 'Close');
+            btn.textContent = '\u2715';
+            dialog.appendChild(btn);
+        }
+        btn.onclick = (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (typeof onClose === 'function') {
+                onClose();
+                return;
+            }
+            const closer = dialog.querySelector('.dialog-closer');
+            if (closer) {
+                closer.click();
+                return;
+            }
+            const backdrop = dialog.closest('.dialog-backdrop');
+            if (backdrop) {
+                backdrop.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            }
+        };
+    }
+
     function buildHelpHtml() {
         return '<div class="ibhv-help">' + [
 
@@ -197,6 +235,7 @@
                 row(['Click title', '\u2630\uFE0E / |||'], 'Toggle sort mode: default order (\u2630\uFE0E) / numeric order (|||)'),
                 row(['\u25B2\uFE0E', '\u25B3\uFE0E'], 'Lock / unlock control bar visibility'),
                 row(['\u25E2\uFE0E'], 'Hide playlist panel'),
+                row(['Long press', 'Drag'], 'Portrait: long-press the blank area beside the playlist title, then drag up / down to resize the video / playlist split (remembered)'),
                 row(['Item click'], 'Play that video'),
                 row(['▶\uFE0E / ₪\uFE0E'], 'Click the current item icon to toggle loop for the current video (▶\uFE0E = off, ₪\uFE0E = on)'),
                 row(['Long press', 'Double-click'], 'Open the file comment dialog'),
@@ -247,6 +286,7 @@
         if (!title || !content) return;
         title.textContent = HELP_TITLE;
         content.innerHTML = buildHelpHtml();
+        addHelpCloseButton(dialog);
         dialog.dataset.ibHelpVideoRewritten = '1';
     }
 
@@ -281,6 +321,7 @@
         backdrop.addEventListener('click', (ev) => {
             if (ev.target === backdrop) close();
         });
+        addHelpCloseButton(backdrop.querySelector('.dialog'), close);
         document.addEventListener('keydown', onEsc, true);
         document.body.appendChild(backdrop);
         backdrop.querySelector('.dialog').dataset.ibHelpVideoRewritten = '1';
@@ -313,6 +354,22 @@
         st.id = STYLE_ID;
         st.textContent = `
 .ibhv-dialog { max-width: 720px; }
+.ibhv-dialog, .ibhv-help-dialog { position: relative; }
+.ibhv-dialog .dialog-title, .ibhv-help-dialog .dialog-title { padding-right: 46px; }
+.ibhv-close-btn {
+    position: absolute; top: 8px; right: 8px;
+    width: 32px; height: 32px; padding: 0; margin: 0;
+    display: flex; align-items: center; justify-content: center;
+    border: 1px solid currentColor; border-radius: 50%;
+    background: transparent; color: inherit; font: inherit;
+    font-size: 16px; line-height: 1; cursor: pointer;
+    opacity: .72; z-index: 20;
+}
+.ibhv-close-btn:hover,
+.ibhv-close-btn:focus-visible {
+    opacity: 1; outline: none;
+    background: color-mix(in srgb, currentColor 12%, transparent);
+}
 .ibhv-help {
     display: flex; flex-direction: column; gap: 14px;
     padding: 4px 0; max-height: 72vh; overflow-y: auto;

@@ -496,6 +496,9 @@ html.${PLAYBACK_ROOT_CLASS} * {
                         const img = e.target;
                         if (!isDirThumb(img)) continue;
                         if (active) { suspend(img); continue; }
+                        // Stop-images-on-navigate 有統一的嚴格視口管控（含尺寸/方向變動）時，
+                        // 清單縮略圖交給它裁決，避免兩套 rootMargin 互相把圖復活。
+                        if (window.__hfsThumbGate && window.__hfsThumbGate.version) continue;
                         if (e.isIntersecting) resume(img);
                         else suspend(img);
                     }
@@ -551,6 +554,9 @@ html.${PLAYBACK_ROOT_CLASS} * {
                 document.documentElement.classList.add(PLAYBACK_ROOT_CLASS);
                 if (scrollIO) { scrollIO.disconnect(); scrollIO = null; }
                 suspendAllThumbs();
+                // 播放 / file-show 期間由本插件接管：連 Stop-images-on-navigate 也暫停恢復
+                const gate = window.__hfsThumbGate;
+                if (gate && gate.setHold) gate.setHold(true);
             }
 
             function exit() {
@@ -561,6 +567,8 @@ html.${PLAYBACK_ROOT_CLASS} * {
                     if (active) return;
                     buildIO();
                     observeAll();
+                    const gate = window.__hfsThumbGate;
+                    if (gate && gate.setHold) gate.setHold(false);
                 }, 300);
             }
 
@@ -1439,6 +1447,23 @@ const compareByNumbersThenDate = (a, b) => {
             try { localStorage.setItem('vjs-playlist-open', open ? '1' : '0'); } catch {}
         };
 
+        // Vertical split between the video and the playlist in portrait mode.
+        const PLAYLIST_RATIO_DEFAULT = 0.4;
+        const PLAYLIST_RATIO_MIN = 0.12;
+        const PLAYLIST_RATIO_MAX = 0.85;
+
+        const readPlaylistRatio = () => {
+            try {
+                const v = parseFloat(localStorage.getItem('vjs-playlist-ratio'));
+                if (isFinite(v) && v >= PLAYLIST_RATIO_MIN && v <= PLAYLIST_RATIO_MAX) return v;
+            } catch {}
+            return PLAYLIST_RATIO_DEFAULT;
+        };
+
+        const writePlaylistRatio = (ratio) => {
+            try { localStorage.setItem('vjs-playlist-ratio', String(ratio)); } catch {}
+        };
+
         const getCurrentFileShowName = () => {
             const bar = document.querySelector(
                 '.dialog-backdrop.file-show .bar .filename, ' +
@@ -1704,7 +1729,7 @@ const compareByNumbersThenDate = (a, b) => {
             hfsStateWatch = setInterval(check, 800);
         };
 
-        const PlaylistPanel = ({ src, playerRef, open, onClose, controlsLocked, onToggleControlsLocked, onRegisterNav }) => {
+        const PlaylistPanel = ({ src, playerRef, open, portrait, onClose, controlsLocked, onToggleControlsLocked, onRegisterNav }) => {
             const [items, setItems] = React.useState(() => {
                 const fu = getFolderUri(src);
                 const lock = fu && playlistSnapshots.get(fu);
@@ -1746,10 +1771,157 @@ const compareByNumbersThenDate = (a, b) => {
             }, []);
 
             const panelRef = React.useRef(null);
+            const headerRef = React.useRef(null);
             const listRef = React.useRef(null);
             const currentItemRef = React.useRef(null);
             const hasAutoScrolledRef = React.useRef(false);
             const autoAdvancingRef = React.useRef(false);
+
+            // Portrait only: apply the remembered video/playlist vertical split.
+            React.useEffect(() => {
+                const panel = panelRef.current;
+                if (!panel) return;
+                const wrapper = panel.parentElement;
+                if (!wrapper) return;
+
+                const apply = () => {
+                    if (!open || !portrait) {
+                        panel.style.height = '';
+                        panel.style.maxHeight = '';
+                        return;
+                    }
+                    if (panel.classList.contains('is-resizing')) return;
+                    const wrapperH = wrapper.getBoundingClientRect().height;
+                    if (!wrapperH) return;
+                    const ratio = readPlaylistRatio();
+                    panel.style.height = Math.round(ratio * wrapperH) + 'px';
+                    panel.style.maxHeight = 'none';
+                };
+
+                apply();
+                window.addEventListener('resize', apply);
+                window.addEventListener('orientationchange', apply);
+                return () => {
+                    window.removeEventListener('resize', apply);
+                    window.removeEventListener('orientationchange', apply);
+                };
+            }, [open, portrait]);
+
+            // Portrait only: long-press the blank part of the playlist header
+            // and drag vertically to change the video/playlist split.
+            React.useEffect(() => {
+                if (!open || !portrait) return;
+                const header = headerRef.current;
+                const panel = panelRef.current;
+                if (!header || !panel) return;
+                const wrapper = panel.parentElement;
+                if (!wrapper) return;
+
+                let pressTimer = null;
+                let drag = null;
+
+                const isInteractive = (target) => !!(target && target.closest && target.closest(
+                    'button, a, input, select, textarea, .vjs-playlist-title, .vjs-playlist-count, .vjs-playlist-bitrate'
+                ));
+
+                const begin = () => {
+                    if (!drag) return;
+                    drag.active = true;
+                    panel.classList.add('is-resizing');
+                    document.body.classList.add('vjs-playlist-resizing');
+                    try { header.setPointerCapture(drag.pointerId); } catch (e) {}
+                    try { const sel = window.getSelection(); if (sel) sel.removeAllRanges(); } catch (e) {}
+                };
+
+                const onDown = (event) => {
+                    if (event.button !== undefined && event.button !== 0) return;
+                    if (isInteractive(event.target)) return;
+                    const rect = panel.getBoundingClientRect();
+                    const wrapperH = wrapper.getBoundingClientRect().height;
+                    if (!rect.height || !wrapperH) return;
+                    if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+                    drag = {
+                        pointerId: event.pointerId,
+                        startY: event.clientY,
+                        startX: event.clientX,
+                        startHeight: rect.height,
+                        wrapperH,
+                        currentHeight: rect.height,
+                        active: false,
+                    };
+                    if (event.pointerType === 'mouse') {
+                        begin();
+                    } else {
+                        pressTimer = setTimeout(() => {
+                            pressTimer = null;
+                            begin();
+                        }, 300);
+                    }
+                };
+
+                const onMove = (event) => {
+                    if (!drag) return;
+                    if (!drag.active) {
+                        if (Math.abs(event.clientY - drag.startY) > 8 ||
+                            Math.abs(event.clientX - drag.startX) > 8) {
+                            if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+                            drag = null;
+                        }
+                        return;
+                    }
+                    if (event.cancelable) event.preventDefault();
+                    const minH = Math.max(110, drag.wrapperH * PLAYLIST_RATIO_MIN);
+                    const maxH = Math.min(drag.wrapperH * PLAYLIST_RATIO_MAX, drag.wrapperH - 90);
+                    const next = Math.min(maxH, Math.max(minH, drag.startHeight + (drag.startY - event.clientY)));
+                    drag.currentHeight = next;
+                    panel.style.height = Math.round(next) + 'px';
+                    panel.style.maxHeight = 'none';
+                };
+
+                const finish = (save) => {
+                    if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+                    if (!drag) return;
+                    const wasActive = drag.active;
+                    const h = drag.currentHeight;
+                    const wrapperH = drag.wrapperH;
+                    drag = null;
+                    if (!wasActive) return;
+                    panel.classList.remove('is-resizing');
+                    document.body.classList.remove('vjs-playlist-resizing');
+                    const ratio = (save && h && wrapperH)
+                        ? Math.min(PLAYLIST_RATIO_MAX, Math.max(PLAYLIST_RATIO_MIN, h / wrapperH))
+                        : readPlaylistRatio();
+                    if (save && h && wrapperH) writePlaylistRatio(ratio);
+                    const wrapperHeight = wrapper.getBoundingClientRect().height;
+                    if (wrapperHeight) {
+                        panel.style.height = Math.round(ratio * wrapperHeight) + 'px';
+                        panel.style.maxHeight = 'none';
+                    }
+                };
+
+                const onUp = () => finish(true);
+                const onCancel = () => finish(false);
+                const onContext = (event) => {
+                    if (!isInteractive(event.target)) event.preventDefault();
+                };
+
+                header.addEventListener('pointerdown', onDown);
+                window.addEventListener('pointermove', onMove, { passive: false });
+                window.addEventListener('pointerup', onUp);
+                window.addEventListener('pointercancel', onCancel);
+                header.addEventListener('contextmenu', onContext);
+
+                return () => {
+                    if (pressTimer) clearTimeout(pressTimer);
+                    header.removeEventListener('pointerdown', onDown);
+                    window.removeEventListener('pointermove', onMove);
+                    window.removeEventListener('pointerup', onUp);
+                    window.removeEventListener('pointercancel', onCancel);
+                    header.removeEventListener('contextmenu', onContext);
+                    panel.classList.remove('is-resizing');
+                    document.body.classList.remove('vjs-playlist-resizing');
+                };
+            }, [open, portrait]);
 
             const itemsRef = React.useRef(items);
             itemsRef.current = items;
@@ -2394,7 +2566,7 @@ const compareByNumbersThenDate = (a, b) => {
                 className: 'vjs-playlist' + (open ? ' is-open' : ''),
                 ref: panelRef,
             }, [
-                h('div', { className: 'vjs-playlist-header', key: 'header' }, [
+                h('div', { className: 'vjs-playlist-header', key: 'header', ref: headerRef }, [
                     h('div', { className: 'vjs-playlist-header-left', key: 'left' }, [
                         h('span', {
                             className: 'vjs-playlist-title' + (sortSwitching ? ' is-switching' : ''),
@@ -2830,6 +3002,31 @@ const compareByNumbersThenDate = (a, b) => {
                     return false;
                 }
             });
+
+            const [isMobilePortrait, setIsMobilePortrait] = React.useState(() => {
+                try {
+                    return window.matchMedia('(max-width: 640px) and (orientation: portrait)').matches;
+                } catch {
+                    return false;
+                }
+            });
+
+            React.useEffect(() => {
+                let mq = null;
+                try {
+                    mq = window.matchMedia('(max-width: 640px) and (orientation: portrait)');
+                } catch (e) {
+                    return;
+                }
+                const onChange = () => setIsMobilePortrait(!!mq.matches);
+                if (mq.addEventListener) mq.addEventListener('change', onChange);
+                else if (mq.addListener) mq.addListener(onChange);
+                onChange();
+                return () => {
+                    if (mq.removeEventListener) mq.removeEventListener('change', onChange);
+                    else if (mq.removeListener) mq.removeListener(onChange);
+                };
+            }, []);
 
             const toggleControlsLocked = React.useCallback(() => {
                 setControlsLocked(prev => {
@@ -3592,10 +3789,6 @@ const compareByNumbersThenDate = (a, b) => {
                 return h('div', { style: { width: '100%', height: '100%', minHeight: '150px', display: 'flex', alignItems: 'center', justifyContent: 'center', backgroundColor: '#000', color: '#666', fontFamily: 'sans-serif' } }, 'No Video Selected');
             }
 
-            const isMobilePortrait = (() => {
-                try { return window.matchMedia('(max-width: 640px) and (orientation: portrait)').matches; } catch { return false; }
-            })();
-
             const wrapperClass = 'vjs-player-wrapper'
                 + ' has-playlist'
                 + (playlistOpen ? ' playlist-open' : '')
@@ -3619,6 +3812,7 @@ const compareByNumbersThenDate = (a, b) => {
                     src: props.src,
                     playerRef: playerRef,
                     open: playlistOpen,
+                    portrait: isMobilePortrait,
                     onClose: () => togglePlaylist(false),
                     controlsLocked: controlsLocked,
                     onToggleControlsLocked: toggleControlsLocked,

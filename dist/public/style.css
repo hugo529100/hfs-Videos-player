@@ -1480,6 +1480,22 @@ video::-webkit-media-text-track-display {
   max-height: 50vh;
 }
 
+/* 手機竪屏：長按標題列空白處可上下拖動調整畫面／列表比例 */
+.vjs-player-wrapper.is-mobile-portrait .vjs-playlist-header {
+  cursor: ns-resize;
+  touch-action: none;
+  -webkit-touch-callout: none;
+}
+
+.vjs-playlist.is-resizing {
+  transition: none !important;
+}
+
+body.vjs-playlist-resizing {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
 /* 標題列 */
 .vjs-playlist-header {
   display: flex;
