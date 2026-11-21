@@ -20,6 +20,24 @@
 
         const rawConfig = HFS.getPluginConfig ? HFS.getPluginConfig() : {};
 
+        // HFS.getPluginPublic() only works while the plugin script is being
+        // evaluated synchronously (it reads document.currentScript). Capture
+        // the directory now so it can also be used when hls.js is lazily
+        // loaded later from playViaHls().
+        const PLUGIN_PUBLIC_URL = (() => {
+            try {
+                const script = document.currentScript;
+                if (script && script.src) return new URL('.', script.src).href;
+            } catch (e) {}
+            try {
+                if (HFS && typeof HFS.getPluginPublic === 'function') {
+                    const url = HFS.getPluginPublic();
+                    if (url) return url;
+                }
+            } catch (e) {}
+            return '/~/plugins/Videos-player+/';
+        })();
+
         const C = {
             autoplay: true,
             controls: true,
@@ -400,12 +418,13 @@
 
         const loopStateByUrl = new Map();
 
-        // HLS library loader (hls.light.min.js preloaded by plugin.js).
+        // HLS library loader. It is only needed when server transcoding falls
+        // back to HLS (?ffmpeg=hls); load it on demand instead of on every page.
         let hlsLoadingPromise = null;
         const loadHlsLib = () => {
             if (window.Hls) return Promise.resolve(window.Hls);
             if (hlsLoadingPromise) return hlsLoadingPromise;
-            const url = (HFS.getPluginPublic ? HFS.getPluginPublic() : '') + 'hls.light.min.js';
+            const url = PLUGIN_PUBLIC_URL + 'hls.light.min.js';
             hlsLoadingPromise = HFS.loadScript(url).then(() => {
                 if (!window.Hls) throw new Error('HLS library failed to load');
                 return window.Hls;
@@ -415,6 +434,12 @@
             });
             return hlsLoadingPromise;
         };
+
+        // Preload it only when transcoding is enabled; otherwise hls.js is never
+        // used (there is no direct m3u8 playback path in this plugin).
+        if (C.enable_ffmpeg_transcoding) {
+            loadHlsLib().catch(() => {});
+        }
 
         // ============================================================
         // === Playback Memory Guard ===
@@ -815,6 +840,26 @@ html.${PLAYBACK_ROOT_CLASS} * {
         ensureSubDialogObserver();
         ensureFileShowCloseObserver();
 
+        // When the HFS Close button is pressed, silence the media immediately
+        // instead of waiting for the dialog's unmount cleanup. This keeps the
+        // close responsive for native MKV playback, whose teardown can stall.
+        const silenceMediaForFileShowClose = (event) => {
+            const target = event.target;
+            if (!target || !target.closest) return;
+            const closeBtn = target.closest('.file-show .bar button[title="Close"]');
+            if (!closeBtn) return;
+            const dialog = closeBtn.closest('.file-show');
+            if (!dialog) return;
+            dialog.querySelectorAll('video').forEach(v => {
+                try {
+                    v.pause();
+                    v.muted = true;
+                } catch (e) {}
+            });
+        };
+        document.addEventListener('pointerdown', silenceMediaForFileShowClose, true);
+        document.addEventListener('click', silenceMediaForFileShowClose, true);
+
         // ============================================================
         // === Helper: 中文数字解析 ===
         // ============================================================
@@ -1086,6 +1131,110 @@ const compareByNumbersThenDate = (a, b) => {
             return 'video/mp4';
         }
 
+        // Chrome can play some Matroska files (H.264/AAC) but fails on HEVC,
+        // E-AC3, DTS, … and some of those failures can hang the renderer instead
+        // of firing a clean media error. When server transcoding is off, peek
+        // at the Matroska header and refuse the file up front if its codecs
+        // cannot be decoded, so Chrome never starts the problematic pipeline.
+        const MKV_PROBE_BYTES = 262144;
+        const mkvSupportCache = new Map();
+
+        const canPlayTypeSafe = (type) => {
+            try {
+                return !!document.createElement('video').canPlayType(type);
+            } catch (e) {
+                return false;
+            }
+        };
+
+        const probeMkvSupport = (src) => {
+            let url;
+            try { url = new URL(src, location.href); } catch (e) { return Promise.resolve(null); }
+            if (!/\.mkv$/i.test(url.pathname)) return Promise.resolve(null);
+            const key = url.pathname;
+            if (mkvSupportCache.has(key)) return mkvSupportCache.get(key);
+
+            const probe = (async () => {
+                let res;
+                try {
+                    res = await fetch(url.href, {
+                        headers: { Range: `bytes=0-${MKV_PROBE_BYTES - 1}` },
+                        cache: 'no-store',
+                        credentials: 'same-origin',
+                    });
+                } catch (e) {
+                    return null;
+                }
+                if (!res.ok) {
+                    try { res.body && res.body.cancel(); } catch (e) {}
+                    return null;
+                }
+                if (res.status !== 206) {
+                    // Range not supported: do not pull a multi-GB file just to probe.
+                    try { res.body && res.body.cancel(); } catch (e) {}
+                    return null;
+                }
+                let bytes;
+                try {
+                    bytes = new Uint8Array(await res.arrayBuffer());
+                } catch (e) {
+                    return null;
+                }
+                const text = new TextDecoder('latin1').decode(bytes);
+
+                const videoCodecs = [
+                    ['V_MPEGH/ISO/HEVC', 'HEVC (H.265)', 'video/mp4; codecs="hvc1.1.6.L93.B0"'],
+                    ['V_MPEG4/ISO/AVC', 'H.264', 'video/mp4; codecs="avc1.42E01E"'],
+                    ['V_MPEG4/ISO/ASP', 'MPEG-4 Part 2', null],
+                    ['V_MPEG2', 'MPEG-2', null],
+                    ['V_AV1', 'AV1', 'video/mp4; codecs="av01.0.05M.08"'],
+                    ['V_VP9', 'VP9', 'video/webm; codecs="vp9"'],
+                    ['V_VP8', 'VP8', 'video/webm; codecs="vp8"'],
+                    ['V_THEORA', 'Theora', null],
+                ];
+                const audioCodecs = [
+                    ['A_AAC', 'AAC', 'audio/mp4; codecs="mp4a.40.2"'],
+                    ['A_AC3', 'AC-3', 'audio/mp4; codecs="ac-3"'],
+                    ['A_EAC3', 'E-AC3', 'audio/mp4; codecs="ec-3"'],
+                    ['A_DTS', 'DTS', null],
+                    ['A_TRUEHD', 'Dolby TrueHD', null],
+                    ['A_FLAC', 'FLAC', 'audio/mp4; codecs="flac"'],
+                    ['A_OPUS', 'Opus', 'audio/webm; codecs="opus"'],
+                    ['A_VORBIS', 'Vorbis', 'audio/webm; codecs="vorbis"'],
+                    ['A_MPEG/L3', 'MP3', 'audio/mpeg'],
+                    ['A_PCM', 'PCM', 'audio/wav'],
+                ];
+
+                const findCodec = (list) => {
+                    for (const entry of list) {
+                        if (text.indexOf(entry[0]) !== -1) return entry;
+                    }
+                    return null;
+                };
+
+                const unsupported = [];
+                const video = findCodec(videoCodecs);
+                if (video) {
+                    const [, label, mime] = video;
+                    if (!mime || !canPlayTypeSafe(mime)) unsupported.push(label);
+                }
+                const audio = findCodec(audioCodecs);
+                if (audio) {
+                    const [, label, mime] = audio;
+                    if (!mime || !canPlayTypeSafe(mime)) unsupported.push(label);
+                }
+                return unsupported.length
+                    ? { blocked: true, codec: unsupported.join(' + ') }
+                    : { blocked: false };
+            })().catch(() => null);
+
+            mkvSupportCache.set(key, probe);
+            probe.then(result => {
+                if (!result) mkvSupportCache.delete(key);
+            });
+            return probe;
+        };
+
         const hardBrakeVideo = (videoEl) => {
             if (!videoEl) return;
             try {
@@ -1093,8 +1242,8 @@ const compareByNumbersThenDate = (a, b) => {
                 const sources = videoEl.querySelectorAll('source');
                 sources.forEach(s => s.remove());
                 videoEl.removeAttribute('src');
-                videoEl.load();
-                videoEl.src = '';
+                // One load is enough to abort the current resource; the old
+                // double load() could stall for a moment on native MKV demuxers.
                 videoEl.load();
             } catch (e) {
                 console.warn('[VideoJS] hardBrakeVideo failed:', e);
@@ -1464,6 +1613,42 @@ const compareByNumbersThenDate = (a, b) => {
             try { localStorage.setItem('vjs-playlist-ratio', String(ratio)); } catch {}
         };
 
+        // Landscape split between the video and the right-hand playlist.
+        // The chosen width is stored in CSS pixels so resizing the window (or
+        // changing the page scale) no longer stretches the playlist.
+        const PLAYLIST_WIDTH_MIN = 0.10;
+        const PLAYLIST_WIDTH_MAX = 0.70;
+        const PLAYLIST_WIDTH_PX_KEY = 'vjs-playlist-width-px';
+        const PLAYLIST_WIDTH_LEGACY_KEY = 'vjs-playlist-width';
+
+        const readPlaylistWidthPx = () => {
+            try {
+                const v = parseFloat(localStorage.getItem(PLAYLIST_WIDTH_PX_KEY));
+                if (isFinite(v) && v >= 80 && v <= 4000) return v;
+            } catch {}
+            return null; // no saved width: keep the CSS default (250px / 25%)
+        };
+
+        const writePlaylistWidthPx = (px) => {
+            try { localStorage.setItem(PLAYLIST_WIDTH_PX_KEY, String(px)); } catch {}
+        };
+
+        // Old versions stored a 0.10–0.70 ratio; convert it once using the
+        // current wrapper width, then keep using pixels from then on.
+        const readPlaylistWidthLegacyRatio = () => {
+            try {
+                const v = parseFloat(localStorage.getItem(PLAYLIST_WIDTH_LEGACY_KEY));
+                if (isFinite(v) && v >= PLAYLIST_WIDTH_MIN && v <= PLAYLIST_WIDTH_MAX) return v;
+            } catch {}
+            return null;
+        };
+
+        // Last applied pixel sizes (module scope: survives the player remount when
+        // switching videos). A remount reuses them when they are still close, so
+        // the playlist does not jump when the video area settles.
+        let lastPortraitPlaylistHeight = 0;
+        let lastLandscapePlaylistWidth = 0;
+
         const getCurrentFileShowName = () => {
             const bar = document.querySelector(
                 '.dialog-backdrop.file-show .bar .filename, ' +
@@ -1774,154 +1959,191 @@ const compareByNumbersThenDate = (a, b) => {
             const headerRef = React.useRef(null);
             const listRef = React.useRef(null);
             const currentItemRef = React.useRef(null);
-            const hasAutoScrolledRef = React.useRef(false);
+            const lastAutoScrollKeyRef = React.useRef('');
             const autoAdvancingRef = React.useRef(false);
+            const initSizeRef = React.useRef(false);
 
-            // Portrait only: apply the remembered video/playlist vertical split.
-            React.useEffect(() => {
+            // Apply the remembered split: playlist width in landscape, height in portrait.
+            // useLayoutEffect + no-transition on the first run: switching videos remounts this
+            // panel, and applying the saved size after paint used to make the whole playlist
+            // animate/jitter on every switch.
+            React.useLayoutEffect(() => {
                 const panel = panelRef.current;
                 if (!panel) return;
                 const wrapper = panel.parentElement;
                 if (!wrapper) return;
 
-                const apply = () => {
-                    if (!open || !portrait) {
+                const apply = (instant) => {
+                    const firstRun = !initSizeRef.current;
+                    initSizeRef.current = true;
+                    if (!open) {
+                        // clear inline sizes so the CSS transition can collapse the panel
+                        panel.style.width = '';
+                        panel.style.maxWidth = '';
                         panel.style.height = '';
                         panel.style.maxHeight = '';
                         return;
                     }
                     if (panel.classList.contains('is-resizing')) return;
-                    const wrapperH = wrapper.getBoundingClientRect().height;
-                    if (!wrapperH) return;
-                    const ratio = readPlaylistRatio();
-                    panel.style.height = Math.round(ratio * wrapperH) + 'px';
-                    panel.style.maxHeight = 'none';
+                    const wr = wrapper.getBoundingClientRect();
+                    if (!wr.width || !wr.height) return;
+                    // first layout (mount) and window/orientation re-applies: jump, don't animate
+                    const noTransition = firstRun || instant === true;
+                    let transitionOff = false;
+                    if (portrait) {
+                        let next = Math.round(readPlaylistRatio() * wr.height);
+                        if (firstRun && lastPortraitPlaylistHeight && Math.abs(next - lastPortraitPlaylistHeight) < 24) {
+                            next = lastPortraitPlaylistHeight;
+                        }
+                        const cur = parseFloat(panel.style.height);
+                        // ignore tiny reflows (e.g. the video area changing a few px after a switch)
+                        if (!firstRun && isFinite(cur) && Math.abs(next - cur) < 24) return;
+                        if (noTransition) { panel.classList.add('no-transition'); transitionOff = true; }
+                        panel.style.width = '';
+                        panel.style.maxWidth = '';
+                        panel.style.height = next + 'px';
+                        panel.style.maxHeight = 'none';
+                        lastPortraitPlaylistHeight = next;
+                    } else {
+                        let savedPx = readPlaylistWidthPx();
+                        if (savedPx == null) {
+                            const legacyRatio = readPlaylistWidthLegacyRatio();
+                            if (legacyRatio != null) {
+                                savedPx = Math.round(legacyRatio * wr.width);
+                                writePlaylistWidthPx(savedPx);
+                                try { localStorage.removeItem(PLAYLIST_WIDTH_LEGACY_KEY); } catch (e) {}
+                            }
+                        }
+                        if (savedPx == null) {
+                            panel.style.width = '';
+                            panel.style.maxWidth = '';
+                        } else {
+                            const minW = Math.max(140, wr.width * PLAYLIST_WIDTH_MIN);
+                            const maxW = Math.max(minW, wr.width * PLAYLIST_WIDTH_MAX);
+                            // Keep the user's pixel width; only clamp it when the
+                            // current window is too narrow for it.
+                            let next = Math.round(Math.min(maxW, Math.max(minW, savedPx)));
+                            if (firstRun && lastLandscapePlaylistWidth && Math.abs(next - lastLandscapePlaylistWidth) < 24) {
+                                next = lastLandscapePlaylistWidth;
+                            }
+                            const cur = parseFloat(panel.style.width);
+                            if (!firstRun && isFinite(cur) && Math.abs(next - cur) < 24) return;
+                            if (noTransition) { panel.classList.add('no-transition'); transitionOff = true; }
+                            panel.style.height = '';
+                            panel.style.maxHeight = '';
+                            panel.style.width = next + 'px';
+                            panel.style.maxWidth = 'none';
+                            lastLandscapePlaylistWidth = next;
+                        }
+                    }
+                    if (transitionOff) {
+                        requestAnimationFrame(() => {
+                            try { panel.classList.remove('no-transition'); } catch (e) {}
+                        });
+                    }
                 };
 
+                let lastOuterW = window.outerWidth;
+                let lastOuterH = window.outerHeight;
+                const onWindowChange = () => {
+                    // Ignore internal layout-induced resize events (file-show re-layout,
+                    // scrollbars after a video switch): only react to real window changes.
+                    if (window.outerWidth === lastOuterW && window.outerHeight === lastOuterH) return;
+                    lastOuterW = window.outerWidth;
+                    lastOuterH = window.outerHeight;
+                    apply(true);
+                };
                 apply();
-                window.addEventListener('resize', apply);
-                window.addEventListener('orientationchange', apply);
+                window.addEventListener('resize', onWindowChange);
+                window.addEventListener('orientationchange', onWindowChange);
                 return () => {
-                    window.removeEventListener('resize', apply);
-                    window.removeEventListener('orientationchange', apply);
+                    window.removeEventListener('resize', onWindowChange);
+                    window.removeEventListener('orientationchange', onWindowChange);
                 };
             }, [open, portrait]);
 
-            // Portrait only: long-press the blank part of the playlist header
-            // and drag vertically to change the video/playlist split.
-            React.useEffect(() => {
-                if (!open || !portrait) return;
-                const header = headerRef.current;
+            // Divider handle: drag to resize (width in landscape, height in portrait).
+            const resizeRef = React.useRef(null);
+
+            const onHandlePointerDown = (event) => {
+                if (event.button !== undefined && event.button !== 0) return;
                 const panel = panelRef.current;
-                if (!header || !panel) return;
-                const wrapper = panel.parentElement;
-                if (!wrapper) return;
-
-                let pressTimer = null;
-                let drag = null;
-
-                const isInteractive = (target) => !!(target && target.closest && target.closest(
-                    'button, a, input, select, textarea, .vjs-playlist-title, .vjs-playlist-count, .vjs-playlist-bitrate'
-                ));
-
-                const begin = () => {
-                    if (!drag) return;
-                    drag.active = true;
-                    panel.classList.add('is-resizing');
-                    document.body.classList.add('vjs-playlist-resizing');
-                    try { header.setPointerCapture(drag.pointerId); } catch (e) {}
-                    try { const sel = window.getSelection(); if (sel) sel.removeAllRanges(); } catch (e) {}
+                const wrapper = panel && panel.parentElement;
+                if (!panel || !wrapper) return;
+                const panelRect = panel.getBoundingClientRect();
+                const wrapperRect = wrapper.getBoundingClientRect();
+                if (!panelRect.width || !panelRect.height || !wrapperRect.width || !wrapperRect.height) return;
+                if (event.cancelable) event.preventDefault();
+                event.stopPropagation();
+                resizeRef.current = {
+                    pointerId: event.pointerId,
+                    portrait,
+                    startX: event.clientX,
+                    startY: event.clientY,
+                    startW: panelRect.width,
+                    startH: panelRect.height,
+                    wrapperW: wrapperRect.width,
+                    wrapperH: wrapperRect.height,
+                    current: portrait ? panelRect.height : panelRect.width,
                 };
+                panel.classList.add('is-resizing');
+                document.body.classList.add('vjs-playlist-resizing');
+                try { event.currentTarget.setPointerCapture(event.pointerId); } catch (e) {}
+                try { const sel = window.getSelection(); if (sel) sel.removeAllRanges(); } catch (e) {}
+            };
 
-                const onDown = (event) => {
-                    if (event.button !== undefined && event.button !== 0) return;
-                    if (isInteractive(event.target)) return;
-                    const rect = panel.getBoundingClientRect();
-                    const wrapperH = wrapper.getBoundingClientRect().height;
-                    if (!rect.height || !wrapperH) return;
-                    if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
-                    drag = {
-                        pointerId: event.pointerId,
-                        startY: event.clientY,
-                        startX: event.clientX,
-                        startHeight: rect.height,
-                        wrapperH,
-                        currentHeight: rect.height,
-                        active: false,
-                    };
-                    if (event.pointerType === 'mouse') {
-                        begin();
-                    } else {
-                        pressTimer = setTimeout(() => {
-                            pressTimer = null;
-                            begin();
-                        }, 300);
-                    }
-                };
-
-                const onMove = (event) => {
-                    if (!drag) return;
-                    if (!drag.active) {
-                        if (Math.abs(event.clientY - drag.startY) > 8 ||
-                            Math.abs(event.clientX - drag.startX) > 8) {
-                            if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
-                            drag = null;
-                        }
-                        return;
-                    }
-                    if (event.cancelable) event.preventDefault();
+            const onHandlePointerMove = (event) => {
+                const drag = resizeRef.current;
+                if (!drag || drag.pointerId !== event.pointerId) return;
+                const panel = panelRef.current;
+                if (!panel) return;
+                if (event.cancelable) event.preventDefault();
+                if (drag.portrait) {
                     const minH = Math.max(110, drag.wrapperH * PLAYLIST_RATIO_MIN);
                     const maxH = Math.min(drag.wrapperH * PLAYLIST_RATIO_MAX, drag.wrapperH - 90);
-                    const next = Math.min(maxH, Math.max(minH, drag.startHeight + (drag.startY - event.clientY)));
-                    drag.currentHeight = next;
+                    const next = Math.min(maxH, Math.max(minH, drag.startH + (drag.startY - event.clientY)));
+                    drag.current = next;
+                    lastPortraitPlaylistHeight = Math.round(next);
                     panel.style.height = Math.round(next) + 'px';
                     panel.style.maxHeight = 'none';
-                };
+                } else {
+                    const minW = Math.max(140, drag.wrapperW * PLAYLIST_WIDTH_MIN);
+                    const maxW = Math.max(minW, drag.wrapperW * PLAYLIST_WIDTH_MAX);
+                    const next = Math.min(maxW, Math.max(minW, drag.startW + (drag.startX - event.clientX)));
+                    drag.current = next;
+                    lastLandscapePlaylistWidth = Math.round(next);
+                    panel.style.width = Math.round(next) + 'px';
+                    panel.style.maxWidth = 'none';
+                }
+            };
 
-                const finish = (save) => {
-                    if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
-                    if (!drag) return;
-                    const wasActive = drag.active;
-                    const h = drag.currentHeight;
-                    const wrapperH = drag.wrapperH;
-                    drag = null;
-                    if (!wasActive) return;
-                    panel.classList.remove('is-resizing');
-                    document.body.classList.remove('vjs-playlist-resizing');
-                    const ratio = (save && h && wrapperH)
-                        ? Math.min(PLAYLIST_RATIO_MAX, Math.max(PLAYLIST_RATIO_MIN, h / wrapperH))
-                        : readPlaylistRatio();
-                    if (save && h && wrapperH) writePlaylistRatio(ratio);
-                    const wrapperHeight = wrapper.getBoundingClientRect().height;
-                    if (wrapperHeight) {
-                        panel.style.height = Math.round(ratio * wrapperHeight) + 'px';
+            const onHandlePointerUp = (event) => {
+                const drag = resizeRef.current;
+                if (!drag || drag.pointerId !== event.pointerId) return;
+                resizeRef.current = null;
+                const panel = panelRef.current;
+                const wrapper = panel && panel.parentElement;
+                if (panel) panel.classList.remove('is-resizing');
+                document.body.classList.remove('vjs-playlist-resizing');
+                if (!panel || !wrapper) return;
+                const wrapperRect = wrapper.getBoundingClientRect();
+                if (drag.portrait) {
+                    const ratio = Math.min(PLAYLIST_RATIO_MAX, Math.max(PLAYLIST_RATIO_MIN, drag.current / drag.wrapperH));
+                    writePlaylistRatio(ratio);
+                    if (wrapperRect.height) {
+                        lastPortraitPlaylistHeight = Math.round(ratio * wrapperRect.height);
+                        panel.style.height = lastPortraitPlaylistHeight + 'px';
                         panel.style.maxHeight = 'none';
                     }
-                };
+                } else {
+                    const px = Math.round(drag.current);
+                    writePlaylistWidthPx(px);
+                    lastLandscapePlaylistWidth = px;
+                    panel.style.width = px + 'px';
+                    panel.style.maxWidth = 'none';
+                }
+            };
 
-                const onUp = () => finish(true);
-                const onCancel = () => finish(false);
-                const onContext = (event) => {
-                    if (!isInteractive(event.target)) event.preventDefault();
-                };
-
-                header.addEventListener('pointerdown', onDown);
-                window.addEventListener('pointermove', onMove, { passive: false });
-                window.addEventListener('pointerup', onUp);
-                window.addEventListener('pointercancel', onCancel);
-                header.addEventListener('contextmenu', onContext);
-
-                return () => {
-                    if (pressTimer) clearTimeout(pressTimer);
-                    header.removeEventListener('pointerdown', onDown);
-                    window.removeEventListener('pointermove', onMove);
-                    window.removeEventListener('pointerup', onUp);
-                    window.removeEventListener('pointercancel', onCancel);
-                    header.removeEventListener('contextmenu', onContext);
-                    panel.classList.remove('is-resizing');
-                    document.body.classList.remove('vjs-playlist-resizing');
-                };
-            }, [open, portrait]);
 
             const itemsRef = React.useRef(items);
             itemsRef.current = items;
@@ -2123,7 +2345,6 @@ const compareByNumbersThenDate = (a, b) => {
             React.useLayoutEffect(() => {
                 if (!open || !folderUri) return;
                 if (sortSwitching) return;
-                if (hasAutoScrolledRef.current) return;
                 if (!sortedItems.length) return;
 
                 const el = listRef.current;
@@ -2135,26 +2356,40 @@ const compareByNumbersThenDate = (a, b) => {
                 const idx = sortedItems.findIndex(it => it.name === currentFilename);
                 if (idx < 0) return;
 
-                const target = el.querySelectorAll('.vjs-playlist-item')[idx];
-                if (target && target.scrollIntoView) {
-                    const prevBehavior = el.style.scrollBehavior;
-                    el.style.scrollBehavior = 'auto';
-                    target.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'auto' });
-                    el.style.scrollBehavior = prevBehavior;
-                }
+                // Scroll only when the current video (or the sort order) changes;
+                // plain list updates must not yank the view back from browsing.
+                const scrollKey = `${folderUri}|${currentFilename}|${forceNumericSort ? 'n' : 'd'}`;
+                if (lastAutoScrollKeyRef.current === scrollKey) return;
 
-                hasAutoScrolledRef.current = true;
-            }, [open, folderUri, sortedItems, src, sortSwitching]);
+                const target = el.querySelectorAll('.vjs-playlist-item')[idx];
+                if (target) {
+                    // Keep the current item inside the list viewport without
+                    // forcing it to the top: when switching to the next video,
+                    // a row that is already visible must not jump.
+                    const listRect = el.getBoundingClientRect();
+                    const targetRect = target.getBoundingClientRect();
+                    const pad = 6;
+                    const above = targetRect.top < listRect.top + pad;
+                    const below = targetRect.bottom > listRect.bottom - pad;
+                    if (above || below) {
+                        const prevBehavior = el.style.scrollBehavior;
+                        el.style.scrollBehavior = 'auto';
+                        if (above) {
+                            el.scrollTop += targetRect.top - listRect.top - pad;
+                        } else {
+                            el.scrollTop += targetRect.bottom - listRect.bottom + pad;
+                        }
+                        el.style.scrollBehavior = prevBehavior;
+                    }
+                    lastAutoScrollKeyRef.current = scrollKey;
+                }
+            }, [open, folderUri, sortedItems, src, sortSwitching, forceNumericSort]);
 
             React.useEffect(() => {
                 if (!open) {
-                    hasAutoScrolledRef.current = false;
+                    lastAutoScrollKeyRef.current = '';
                 }
             }, [open]);
-
-            React.useEffect(() => {
-                hasAutoScrolledRef.current = false;
-            }, [forceNumericSort]);
 
             React.useEffect(() => {
                 if (!open || !folderUri) return;
@@ -2566,6 +2801,16 @@ const compareByNumbersThenDate = (a, b) => {
                 className: 'vjs-playlist' + (open ? ' is-open' : ''),
                 ref: panelRef,
             }, [
+                open && h('div', {
+                    key: 'handle',
+                    className: 'vjs-playlist-handle',
+                    title: 'Drag to resize',
+                    'aria-label': 'Drag to resize',
+                    onPointerDown: onHandlePointerDown,
+                    onPointerMove: onHandlePointerMove,
+                    onPointerUp: onHandlePointerUp,
+                    onPointerCancel: onHandlePointerUp,
+                }),
                 h('div', { className: 'vjs-playlist-header', key: 'header', ref: headerRef }, [
                     h('div', { className: 'vjs-playlist-header-left', key: 'left' }, [
                         h('span', {
@@ -3064,6 +3309,19 @@ const compareByNumbersThenDate = (a, b) => {
                 }
             };
 
+            const reportBlockedMkv = (player, verdict) => {
+                if (!player || player.isDisposed()) return;
+                if (errorShownRef.current) return;
+                errorShownRef.current = true;
+                const codec = verdict && verdict.codec ? ` (${verdict.codec})` : '';
+                notify(
+                    player,
+                    `This MKV cannot be played natively${codec}. Enable "FFmpeg Server Transcoding" to play it.`,
+                    'error',
+                    0
+                );
+            };
+
             const destroyHls = () => {
                 if (hlsRef.current) {
                     try { hlsRef.current.destroy(); } catch (e) {}
@@ -3551,6 +3809,10 @@ const compareByNumbersThenDate = (a, b) => {
                 player.on('error', () => {
                     const code = player.error() ? player.error().code : 0;
                     if (code === 4 || code === 3) {
+                        // With transcoding off there is no recovery path; clearing
+                        // the error repeatedly can make an unsupported file retry
+                        // forever and freeze the page. Handle it once.
+                        if (!C.enable_ffmpeg_transcoding && errorShownRef.current) return;
                         player.error(null);
                         handlePlaybackError(player, code === 3
                             ? "Decode error. Attempting conversion..."
@@ -3561,8 +3823,23 @@ const compareByNumbersThenDate = (a, b) => {
                 });
 
                 return () => {
-                    destroyHls();
-                    hardBrakeVideo(videoElementRef.current);
+                    // Silence the output synchronously so closing the dialog
+                    // feels instant, then let HFS remove the dialog before the
+                    // heavier media teardown. Native MKV demuxers can otherwise
+                    // stall the close for a moment while unwinding.
+                    try {
+                        if (player && !player.isDisposed()) {
+                            player.pause();
+                            player.muted(true);
+                        }
+                    } catch (e) {}
+                    const closingVideoEl = videoElementRef.current;
+                    try {
+                        if (closingVideoEl) {
+                            closingVideoEl.pause();
+                            closingVideoEl.muted = true;
+                        }
+                    } catch (e) {}
 
                     if (debouncedSaveProgress.cancel) debouncedSaveProgress.cancel();
                     saveProgress();
@@ -3575,9 +3852,16 @@ const compareByNumbersThenDate = (a, b) => {
                     document.removeEventListener('webkitfullscreenchange', onFsChange);
                     document.removeEventListener('mozfullscreenchange', onFsChange);
                     document.removeEventListener('MSFullscreenChange', onFsChange);
-                    if (player) player.dispose();
-                    if (videoElementRef.current) videoElementRef.current.remove();
-                    if (containerRef.current) containerRef.current.innerHTML = '';
+
+                    setTimeout(() => {
+                        destroyHls();
+                        hardBrakeVideo(closingVideoEl);
+                        try {
+                            if (player && !player.isDisposed()) player.dispose();
+                        } catch (e) {}
+                        if (closingVideoEl && closingVideoEl.parentNode) closingVideoEl.remove();
+                        if (containerRef.current) containerRef.current.innerHTML = '';
+                    }, 0);
                 };
             }, []);
 
@@ -3594,6 +3878,7 @@ const compareByNumbersThenDate = (a, b) => {
             }, [props.src]);
 
             React.useEffect(() => {
+                let cancelled = false;
                 const player = playerRef.current;
                 if (props.src && player) {
                     const currentSrc = player.currentSrc();
@@ -3618,27 +3903,54 @@ const compareByNumbersThenDate = (a, b) => {
                     if (needsUpdate) {
                         setOverlayState(null);
                         errorShownRef.current = false;
-                        player.src({ src: targetSrc, type: conversionMode ? 'video/mp4' : determineMimeType(props.src) });
-                        if (!conversionMode || C.enable_transcoding_seeking) attemptResume(props.src);
 
-                        const fu = getFolderUri(props.src);
-                        const name = getCurrentFilename(player, props.src);
-                        const key = fu && name ? fu + name : '';
-                        const loopOn = key ? !!loopStateByUrl.get(key) : false;
-                        try { player.loop(loopOn); } catch (e) {}
+                        const applySource = () => {
+                            if (cancelled || !player || player.isDisposed()) return;
+                            player.src({ src: targetSrc, type: conversionMode ? 'video/mp4' : determineMimeType(props.src) });
+                            if (!conversionMode || C.enable_transcoding_seeking) attemptResume(props.src);
 
-                        if (C.autoplay || conversionMode) {
-                            const p = player.play();
-                            if (p && p.catch) p.catch(e => {
-                                if (isConvertingRef.current) return;
-                                console.warn("Auto-play blocked:", e);
-                                if (!player || player.isDisposed() || player.paused()) {
-                                    notify(player, "Click to Play (Autoplay Blocked)", "info", 0);
+                            const fu = getFolderUri(props.src);
+                            const name = getCurrentFilename(player, props.src);
+                            const key = fu && name ? fu + name : '';
+                            const loopOn = key ? !!loopStateByUrl.get(key) : false;
+                            try { player.loop(loopOn); } catch (e) {}
+
+                            if (C.autoplay || conversionMode) {
+                                const p = player.play();
+                                if (p && p.catch) p.catch(e => {
+                                    if (isConvertingRef.current) return;
+                                    if (e && e.name === 'NotSupportedError') return;
+                                    console.warn("Auto-play blocked:", e);
+                                    if (!player || player.isDisposed() || player.paused()) {
+                                        notify(player, "Click to Play (Autoplay Blocked)", "info", 0);
+                                    }
+                                });
+                            }
+                            if (conversionMode && window._vjs_saved_duration) {
+                                player.one('loadedmetadata', () => player.duration(window._vjs_saved_duration));
+                            }
+                        };
+
+                        const isMkv = /\.mkv$/i.test(props.src.split('?')[0]);
+                        if (isMkv && !conversionMode) {
+                            // Refuse HEVC/E-AC3/... MKVs before Chrome's demuxer
+                            // can get stuck on them. When transcoding is enabled,
+                            // jump straight to the server conversion instead of
+                            // trying the native pipeline first.
+                            probeMkvSupport(props.src).then(verdict => {
+                                if (cancelled) return;
+                                if (verdict && verdict.blocked) {
+                                    if (C.enable_ffmpeg_transcoding && !isConvertingRef.current) {
+                                        handlePlaybackError(player, 'Unsupported MKV codecs. Attempting conversion...');
+                                    } else {
+                                        reportBlockedMkv(player, verdict);
+                                    }
+                                    return;
                                 }
+                                applySource();
                             });
-                        }
-                        if (conversionMode && window._vjs_saved_duration) {
-                            player.one('loadedmetadata', () => player.duration(window._vjs_saved_duration));
+                        } else {
+                            applySource();
                         }
                     }
                 }
@@ -3690,6 +4002,7 @@ const compareByNumbersThenDate = (a, b) => {
                 }
 
                 return () => {
+                    cancelled = true;
                     player.off('durationchange', enforceDuration);
                     player.off('timeupdate', enforceDuration);
                     if (cleanupSeek) cleanupSeek();

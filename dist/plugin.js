@@ -1,5 +1,5 @@
 exports.description = "A simplified & lightweight Video.js player plugin, modified from VenB304/videojs-player.";
-exports.version = 3.7;
+exports.version = 3.8;
 exports.apiRequired = 10.0;
 exports.repo = "Hug3O/Videos-player+";
 exports.frontend_css = [
@@ -8,7 +8,6 @@ exports.frontend_css = [
 
 exports.frontend_js = [
     'video.min.js',
-    'hls.light.min.js',
     'player.js',
     'fileshow-help-video.js'
 ];
